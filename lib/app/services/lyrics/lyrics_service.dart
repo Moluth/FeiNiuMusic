@@ -94,6 +94,7 @@ class LyricsService {
 
   int _loadSeq = 0;
   Timer? _lyriconPosTimer;
+  bool _lyriconFlushInFlight = false;
   int _lastLyriconPositionMs = -1;
   bool _lyriconEnabled = false;
   bool _lyriconForceKaraoke = false;
@@ -155,9 +156,9 @@ class LyricsService {
     await LyricAutoSearchSettings.ensureLoaded();
     await LyriconService.setServiceEnabled(_lyriconEnabled);
     if (!_lyriconEnabled) {
-      _lyriconPosTimer?.cancel();
-      _lyriconPosTimer = null;
+      _stopLyriconPositionTimer();
     } else {
+      _syncLyriconPositionTimer();
       final song = _player.currentSong.value;
       await _syncLyriconSong(song, snapshot.value.model);
     }
@@ -177,11 +178,12 @@ class LyricsService {
   void _onPositionChanged() {
     final pos = _player.position.value;
     controller.setProgress(pos);
-    _scheduleLyriconPosition(pos);
+    _syncLyriconPositionTimer();
   }
 
   void _onPlayingChanged() {
-    _syncLyriconPlaybackState();
+    unawaited(_syncLyriconPlaybackState());
+    _syncLyriconPositionTimer();
   }
 
   void _onActiveIndexChanged() {
@@ -349,17 +351,31 @@ class LyricsService {
     await LyriconService.setPlaybackState(_player.isPlaying.value);
   }
 
-  void _scheduleLyriconPosition(Duration position) {
-    if (!_lyriconEnabled) return;
+  void _syncLyriconPositionTimer() {
+    if (!_lyriconEnabled || !_player.isPlaying.value) {
+      _stopLyriconPositionTimer();
+      return;
+    }
     _lyriconPosTimer ??= Timer.periodic(const Duration(milliseconds: 250), (
       _,
     ) async {
-      await _flushLyriconPosition();
+      if (_lyriconFlushInFlight) return;
+      _lyriconFlushInFlight = true;
+      try {
+        await _flushLyriconPosition();
+      } finally {
+        _lyriconFlushInFlight = false;
+      }
     });
   }
 
+  void _stopLyriconPositionTimer() {
+    _lyriconPosTimer?.cancel();
+    _lyriconPosTimer = null;
+  }
+
   Future<void> _flushLyriconPosition() async {
-    if (!_lyriconEnabled) return;
+    if (!_lyriconEnabled || !_player.isPlaying.value) return;
     final ms = _player.position.value.inMilliseconds;
     if ((ms - _lastLyriconPositionMs).abs() < 150) return;
     _lastLyriconPositionMs = ms;

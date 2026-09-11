@@ -138,6 +138,7 @@ class _FeiNiuAudioHandler extends BaseAudioHandler
   List<String> _publishedQueueIds = const <String>[];
   String? _roamQueueAnchorId;
   List<SongEntity>? _stableRoamQueue;
+  List<SongEntity>? _lastSnapshotQueue;
   String? _lastMediaItemKey;
   String? _lastPlaybackStateKey;
   bool _supportsCustomActions = true;
@@ -966,6 +967,8 @@ class _FeiNiuAudioHandler extends BaseAudioHandler
     _requestNotificationPermissionIfNeeded(snap);
     final songId = snap.song?.id;
     final songChanged = songId != _lastSongId;
+    final queueChanged = !identical(snap.queue, _lastSnapshotQueue);
+    _lastSnapshotQueue = snap.queue;
     if (songId != _lastSongId) {
       _lastSongId = songId;
       _currentLyricLine = null;
@@ -994,8 +997,9 @@ class _FeiNiuAudioHandler extends BaseAudioHandler
         _syncMediaItem();
       }
     } else {
-      _syncQueue(snap);
-      _syncMediaItem();
+      if (queueChanged) {
+        _syncQueue(snap);
+      }
     }
     _syncPlaybackState(snap);
     if (songChanged) {
@@ -1176,8 +1180,8 @@ class _FeiNiuAudioHandler extends BaseAudioHandler
       snap.index,
       snap.isPlaying,
       next.processingState.name,
-      snap.position.inMilliseconds,
-      snap.bufferedPosition.inMilliseconds,
+      snap.position.inMilliseconds ~/ 5000,
+      snap.bufferedPosition.inMilliseconds ~/ 10000,
       snap.duration?.inMilliseconds ?? -1,
       player.speed.value,
       _isFavorite,

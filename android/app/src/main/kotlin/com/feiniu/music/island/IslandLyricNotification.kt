@@ -8,11 +8,14 @@ import android.os.Bundle
 import androidx.core.app.NotificationCompat
 import com.feiniu.music.R
 import com.feiniu.music.island.shizuku.ShizukuManager
+import com.feiniu.music.island.shizuku.ShizukuServiceConnection
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * 通知歌词灵动岛 — 原生层。
@@ -43,7 +46,7 @@ class IslandLyricNotification(private val context: Context) {
         private const val CHANNEL_ID_LIVE = "feiniu_island_lyric_live_v1"
 
         /** 歌词行 / 进度更新时重发通知的最小间隔，避免高频刷新压垮系统。 */
-        private const val MIN_UPDATE_INTERVAL_MS = 300L
+        private const val MIN_UPDATE_INTERVAL_MS = 1000L
 
         /** 通知类型常量，与 Dart 层 IslandLyricSettings.typeLive/typeFocus 对应。 */
         const val TYPE_LIVE = 0
@@ -59,9 +62,12 @@ class IslandLyricNotification(private val context: Context) {
     private var lastCoverPath: String? = null
     private var lastAodLyrics: Boolean = false
     private var lastNotificationType: Int = TYPE_LIVE
+    private var cachedCoverPath: String? = null
+    private var cachedCoverIcon: android.graphics.drawable.Icon? = null
 
     /** 异步绕过（Shizuku 拦/放 XMSF 网络）专用作用域，与通知发送生命周期隔离。 */
     private val shizukuScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val bypassMutex = Mutex()
 
     /** 上次焦点通知是否已尝试（或正处于）Shizuku 绕过流程。 */
     private var lastBypassFocusLimit: Boolean = false
@@ -138,13 +144,17 @@ class IslandLyricNotification(private val context: Context) {
         val aodLyricsChanged = aodLyrics != lastAodLyrics
         val typeChanged = notificationType != lastNotificationType
         val bypassChanged = bypassFocusLimit != lastBypassFocusLimit
+        val shouldReleaseBypassService = lastBypassFocusLimit && !bypassFocusLimit
         lastCoverPath = coverPath
         lastAodLyrics = aodLyrics
         lastBypassFocusLimit = bypassFocusLimit
+        if (shouldReleaseBypassService) {
+            releaseBypassService()
+        }
 
         val now = System.currentTimeMillis()
         // 实时通知只随歌词变化刷新：进度变化不触发重发（避免高频重发）。
-        // 焦点通知保留进度驱动（300ms 节流）。
+        // 焦点通知保留进度驱动（1s 节流）。
         val progressChanged = notificationType != TYPE_LIVE &&
             (now - lastUpdateMs) >= MIN_UPDATE_INTERVAL_MS
 
@@ -188,7 +198,11 @@ class IslandLyricNotification(private val context: Context) {
         if (notificationType == TYPE_LIVE) {
             notifyLive(uiState, coverPath, duration)
         } else {
-            notifyFocusWithBypass(uiState, coverPath, bypassFocusLimit)
+            val contentChanged = lyricChanged || songChanged || coverChanged ||
+                aodLyricsChanged || typeChanged || bypassChanged
+            // 白名单绕过只用于建立/更新通知内容。纯进度帧直接更新已存在的
+            // 焦点通知，避免每 300ms 切换一次系统服务防火墙规则。
+            notifyFocusWithBypass(uiState, coverPath, bypassFocusLimit && contentChanged)
         }
     }
 
@@ -201,6 +215,9 @@ class IslandLyricNotification(private val context: Context) {
         lastAodLyrics = false
         lastNotificationType = TYPE_LIVE
         lastBypassFocusLimit = false
+        cachedCoverPath = null
+        cachedCoverIcon = null
+        releaseBypassService()
     }
 
     /** 焦点通知路径：extras 携带焦点 JSON 交给 HyperOS 灵动岛渲染。 */
@@ -273,29 +290,48 @@ class IslandLyricNotification(private val context: Context) {
         }
 
         shizukuScope.launch {
+            if (!bypassMutex.tryLock()) {
+                // 上一轮仍在处理；跳过中间进度帧，后续位置事件会继续刷新。
+                return@launch
+            }
             var networkDisabled = false
             try {
-                val disableSuccess = ShizukuManager.setXmsfNetworkingEnabled(context, false)
-                if (disableSuccess) {
-                    networkDisabled = true
-                    android.util.Log.d(TAG, "已拦截 XMSF 网络，准备发送焦点通知")
-                } else {
-                    android.util.Log.w(TAG, "Shizuku 拦截 XMSF 网络失败，按普通焦点通知发送")
-                }
-            } catch (e: Throwable) {
-                android.util.Log.e(TAG, "Shizuku 拦截 XMSF 网络异常", e)
-            }
-
-            notifyFocus(uiState, coverPath)
-
-            if (networkDisabled) {
-                delay(100L)
                 try {
-                    ShizukuManager.setXmsfNetworkingEnabled(context, true)
-                    android.util.Log.d(TAG, "已恢复 XMSF 网络")
+                    val disableSuccess =
+                        ShizukuManager.setXmsfNetworkingEnabled(context, false)
+                    if (disableSuccess) {
+                        networkDisabled = true
+                        android.util.Log.d(TAG, "已拦截 XMSF 网络，准备发送焦点通知")
+                    } else {
+                        android.util.Log.w(TAG, "Shizuku 拦截 XMSF 网络失败，按普通焦点通知发送")
+                    }
                 } catch (e: Throwable) {
-                    android.util.Log.e(TAG, "恢复 XMSF 网络异常", e)
+                    android.util.Log.e(TAG, "Shizuku 拦截 XMSF 网络异常", e)
                 }
+
+                notifyFocus(uiState, coverPath)
+
+                if (networkDisabled) {
+                    delay(100L)
+                }
+            } finally {
+                if (networkDisabled) {
+                    try {
+                        ShizukuManager.setXmsfNetworkingEnabled(context, true)
+                        android.util.Log.d(TAG, "已恢复 XMSF 网络")
+                    } catch (e: Throwable) {
+                        android.util.Log.e(TAG, "恢复 XMSF 网络异常", e)
+                    }
+                }
+                bypassMutex.unlock()
+            }
+        }
+    }
+
+    private fun releaseBypassService() {
+        shizukuScope.launch {
+            bypassMutex.withLock {
+                ShizukuServiceConnection.release()
             }
         }
     }
@@ -405,8 +441,14 @@ class IslandLyricNotification(private val context: Context) {
      * AlbumImageHelper.processAlbumBitmap），供实时通知 small/large icon、
      * 焦点通知 miui.focus.pics 使用。
      */
+    @Synchronized
     private fun loadCoverIcon(coverPath: String?): android.graphics.drawable.Icon? {
-        if (coverPath.isNullOrBlank()) return null
+        if (coverPath.isNullOrBlank()) {
+            cachedCoverPath = null
+            cachedCoverIcon = null
+            return null
+        }
+        if (coverPath == cachedCoverPath) return cachedCoverIcon
         return try {
             val file = java.io.File(coverPath)
             if (!file.exists()) return null
@@ -414,7 +456,10 @@ class IslandLyricNotification(private val context: Context) {
                 ?: return null
             val rounded = roundRectBitmap(source)
             if (rounded == null) return null
-            android.graphics.drawable.Icon.createWithBitmap(rounded)
+            android.graphics.drawable.Icon.createWithBitmap(rounded).also {
+                cachedCoverPath = coverPath
+                cachedCoverIcon = it
+            }
         } catch (e: Exception) {
             android.util.Log.w(TAG, "加载封面失败 coverPath=$coverPath", e)
             null

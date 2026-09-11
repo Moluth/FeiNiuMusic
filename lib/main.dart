@@ -4,7 +4,6 @@ import 'dart:ui' show PlatformDispatcher;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_displaymode/flutter_displaymode.dart';
 import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -61,25 +60,20 @@ Future<void> main() async {
   // + 堆栈写入调试日志（设置→版本信息→导出日志可见），同时转发给原 handler。
   final originalFlutterError = FlutterError.onError;
   FlutterError.onError = (FlutterErrorDetails details) {
-    DebugLogService.instance
-        .add('[FlutterError] ${details.exceptionAsString()}\n'
-            '${details.stack ?? ''}');
+    DebugLogService.instance.add(
+      '[FlutterError] ${details.exceptionAsString()}\n'
+      '${details.stack ?? ''}',
+    );
     originalFlutterError?.call(details);
   };
   PlatformDispatcher.instance.onError = (error, stack) {
-    DebugLogService.instance
-        .add('[PlatformDispatcher] $error\n$stack');
+    DebugLogService.instance.add('[PlatformDispatcher] $error\n$stack');
     // 返回 false：仅记录，不拦截默认崩溃处理（避免掩盖真正的进程级错误）
     return false;
   };
   // TV 检测必须在 runApp 前完成，避免首帧后再切换布局造成闪变。
-  // TV 面板固定 60Hz，强制高刷无意义甚至闪烁，因此高刷调用跳过 TV。
   await TvDetection.ensureLoaded();
   final isTvDevice = TvDetection.result.value;
-  // flutter_displaymode 仅 Android 实现；Windows/桌面端跳过（无高刷概念）。
-  if (!isTvDevice && Platform.isAndroid) {
-    await FlutterDisplayMode.setHighRefreshRate();
-  }
   // 先加载设置：确保持久化的「TV 模式」手动开关已就位，再合并检测结果。
   // 必须放在 syncTvMode() 之前，否则重启后已开启的开关读不进来，
   // tvMode 会被算成 false（设置不丢失，但布局不会切到 TV）。
@@ -196,9 +190,6 @@ Future<void> main() async {
   // 迁移歌曲缓存到系统标准缓存目录后，启动时顺手清理旧版 app-support 目录中的
   // 缓存（仅首次运行执行一次，见 StreamCacheService.cleanupLegacyDirOnce）。
   unawaited(StreamCacheService.instance.cleanupLegacyDirOnce());
-  // 自动备份：每天首次打开 App 时静默备份到已配置的 WebDAV 目标。
-  // fire-and-forget，失败不阻塞启动。
-  unawaited(BackupService.instance.maybeAutoBackupOnLaunch());
   // 液体玻璃：预热 shader（非阻塞异步磁盘 I/O，0.30.x 保证 runApp 前零 GPU
   // 调用，首帧不卡顿）。开关只决定渲染哪个组件分支，此处始终初始化。
   await LiquidGlassWidgets.initialize();
@@ -236,6 +227,11 @@ Future<void> main() async {
   // 后台连接预热：静默验证缓存连接的可用性，不可用时自动回退完整探测
   // 不阻塞首页渲染，首页首次请求走已有连接，预热找到更好的 URL 会无缝切换。
   _warmupConnection();
+  // 自动备份属于低优先级全量磁盘/网络任务，延后到启动与连接预热稳定后执行，
+  // 避免与首屏、账号恢复、更新检查同时争用 CPU 和网络。
+  Timer(const Duration(seconds: 30), () {
+    unawaited(BackupService.instance.maybeAutoBackupOnLaunch());
+  });
 }
 
 /// 进程级 SSL 证书校验覆盖
@@ -323,7 +319,6 @@ void _warmupConnection() {
 void _warmupDirectIpConnection() {
   // fire-and-forget：不 await，不抛异常到顶层
   unawaited(
-    FnConnectionProbeService.instance
-        .upgradeLiveConnectionToHttpsIfRedirects(),
+    FnConnectionProbeService.instance.upgradeLiveConnectionToHttpsIfRedirects(),
   );
 }

@@ -52,6 +52,11 @@ class FnAutoReconnectService with WidgetsBindingObserver {
 
   /// 断开重试间隔
   static const Duration _retryInterval = Duration(seconds: 5);
+  static const Duration _maxRetryInterval = Duration(minutes: 1);
+  static const Duration _backgroundRetryInterval = Duration(minutes: 1);
+  static const Duration _backgroundMaxRetryInterval = Duration(minutes: 5);
+  int _retryAttempt = 0;
+  bool _appInForeground = true;
 
   /// 是否有被推迟的重连（触发时探测正好在进行中）。
   ///
@@ -86,7 +91,9 @@ class FnAutoReconnectService with WidgetsBindingObserver {
     FeiNiuApiClient.instance.addRecoveryMonitor(_onApiRecovery);
 
     // 4. 探测结束补发被推迟的重连
-    FnConnectionProbeService.instance.isProbing.addListener(_onProbeStateChanged);
+    FnConnectionProbeService.instance.isProbing.addListener(
+      _onProbeStateChanged,
+    );
 
     if (kDebugMode) {
       debugPrint('[AutoReconnect] Initialized');
@@ -109,7 +116,20 @@ class FnAutoReconnectService with WidgetsBindingObserver {
   /// 不打扰用户。不做周期探测。
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state != AppLifecycleState.resumed) return;
+    _appInForeground = state == AppLifecycleState.resumed;
+    if (!_appInForeground) {
+      if (_retryTimer?.isActive ?? false) {
+        _retryTimer?.cancel();
+        _retryTimer = null;
+        _scheduleRetryIfDisconnected();
+      }
+      return;
+    }
+    if (!AppFnConnectionSettings.serverConnected.value) {
+      _retryTimer?.cancel();
+      _retryTimer = null;
+      _scheduleRetryIfDisconnected();
+    }
     if (_verifyInFlight) return;
     if (FnConnectionProbeService.instance.isProbing.value) return;
     final fnId = AppFnConnectionSettings.lastFnId;
@@ -135,7 +155,6 @@ class FnAutoReconnectService with WidgetsBindingObserver {
         }
         AppFnConnectionSettings.serverConnected.value = false;
         _triggerReconnect(reason: '回到前台，连接不可达，重新连接');
-        _scheduleRetryIfDisconnected();
       } finally {
         _verifyInFlight = false;
       }
@@ -154,6 +173,9 @@ class FnAutoReconnectService with WidgetsBindingObserver {
 
     if (hasConnection) {
       // 网络恢复后再等一会，让网络稳定下来
+      _retryTimer?.cancel();
+      _retryTimer = null;
+      _retryAttempt = 0;
       _debounceTimer?.cancel();
       _debounceTimer = Timer(_debounceDelay, () {
         _triggerReconnect(reason: '网络已恢复');
@@ -169,20 +191,31 @@ class FnAutoReconnectService with WidgetsBindingObserver {
   void onConnectionLost({String reason = '服务器连接失败'}) {
     AppFnConnectionSettings.serverConnected.value = false;
     _triggerReconnect(reason: reason);
-    _scheduleRetryIfDisconnected();
   }
 
-  /// 断开期间周期重试：每 [_retryInterval] 探测一次，直到连接恢复
+  /// 断开期间退避重试：上一轮失败后再安排下一轮，避免慢探测与周期 tick 重叠。
   void _scheduleRetryIfDisconnected() {
     if (AppFnConnectionSettings.serverConnected.value) return;
-    _retryTimer?.cancel();
-    _retryTimer = Timer(_retryInterval, _onRetryTick);
+    if (_retryTimer?.isActive ?? false) return;
+    final baseInterval = _appInForeground
+        ? _retryInterval
+        : _backgroundRetryInterval;
+    final maxInterval = _appInForeground
+        ? _maxRetryInterval
+        : _backgroundMaxRetryInterval;
+    final exponent = _retryAttempt > 4 ? 4 : _retryAttempt;
+    final candidateDelayMs = baseInterval.inMilliseconds * (1 << exponent);
+    final delayMs = candidateDelayMs > maxInterval.inMilliseconds
+        ? maxInterval.inMilliseconds
+        : candidateDelayMs;
+    _retryAttempt++;
+    _retryTimer = Timer(Duration(milliseconds: delayMs), _onRetryTick);
   }
 
   void _onRetryTick() {
+    _retryTimer = null;
     if (AppFnConnectionSettings.serverConnected.value) return;
     _triggerReconnect(reason: '连接断开自动重试');
-    _scheduleRetryIfDisconnected();
   }
 
   /// API 请求成功回调：恢复连接状态
@@ -193,6 +226,7 @@ class FnAutoReconnectService with WidgetsBindingObserver {
         debugPrint('[AutoReconnect] API recovered, connection restored');
       }
     }
+    _retryAttempt = 0;
     _retryTimer?.cancel();
     _retryTimer = null;
   }
@@ -222,7 +256,6 @@ class FnAutoReconnectService with WidgetsBindingObserver {
       _consecutiveFailures = 0;
       AppFnConnectionSettings.serverConnected.value = false;
       _triggerReconnect(reason: '连接连续失败 $_failureThreshold 次');
-      _scheduleRetryIfDisconnected();
     }
   }
 
@@ -280,7 +313,10 @@ class FnAutoReconnectService with WidgetsBindingObserver {
   }
 
   /// 应用探测结果：更新连接信息、API 客户端 baseUrl / relay 模式，并恢复连接状态。
-  Future<void> _applyProbeResult(String fnId, ConnectionProbeResult result) async {
+  Future<void> _applyProbeResult(
+    String fnId,
+    ConnectionProbeResult result,
+  ) async {
     // 更新连接信息
     await AppFnConnectionSettings.saveProbeResult(
       fnId: fnId,
@@ -309,6 +345,7 @@ class FnAutoReconnectService with WidgetsBindingObserver {
     AppFnConnectionSettings.serverConnected.value = true;
     _consecutiveFailures = 0;
     _pendingReconnect = false;
+    _retryAttempt = 0;
     _retryTimer?.cancel();
     _retryTimer = null;
     // 把探测得到的连接信息回写当前账号，保持账号列表与连接一致
@@ -318,8 +355,9 @@ class FnAutoReconnectService with WidgetsBindingObserver {
   /// 释放资源
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    FnConnectionProbeService.instance.isProbing
-        .removeListener(_onProbeStateChanged);
+    FnConnectionProbeService.instance.isProbing.removeListener(
+      _onProbeStateChanged,
+    );
     _connectivitySub?.cancel();
     _debounceTimer?.cancel();
     _retryTimer?.cancel();

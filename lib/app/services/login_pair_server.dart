@@ -37,52 +37,80 @@ class LoginPairServer {
   LoginPairServer._();
 
   static HttpServer? _server;
-  static String? _token;
   static List<String>? _urls;
-  static Completer<LoginCredentials>? _pending;
-  static bool _consumed = false;
+  static Completer<LoginCredentials?>? _pending;
+  static Future<LoginPairSession>? _startFuture;
+  static int _generation = 0;
 
   /// 启动服务（幂等）。返回带随机 token 的局域网 URL 列表。
   static Future<LoginPairSession> start() async {
     if (_server != null) {
       return LoginPairSession(List.of(_urls!));
     }
-    _consumed = false;
-    _pending = Completer<LoginCredentials>();
-    _token = _generateToken();
+    final inFlight = _startFuture;
+    if (inFlight != null) return inFlight;
+    final future = _start(_generation);
+    _startFuture = future;
+    try {
+      return await future;
+    } finally {
+      if (identical(_startFuture, future)) {
+        _startFuture = null;
+      }
+    }
+  }
+
+  static Future<LoginPairSession> _start(int generation) async {
+    final pending = Completer<LoginCredentials?>();
+    final token = _generateToken();
 
     final handler = const Pipeline()
         .addMiddleware(logRequests())
-        .addHandler(_handle);
+        .addHandler((request) => _handle(request, token, pending));
     final server = await shelf_io.serve(handler, InternetAddress.anyIPv4, 0);
-    _server = server;
+    if (generation != _generation) {
+      await server.close(force: true);
+      throw StateError('配对服务已停止');
+    }
 
     final port = server.port;
     final addresses = await _localIpv4s();
-    _urls = [
-      for (final ip in addresses) 'http://$ip:$port/f/$_token',
-    ];
-    if (_urls!.isEmpty) {
-      _urls = ['http://127.0.0.1:$port/f/$_token'];
+    if (generation != _generation) {
+      await server.close(force: true);
+      throw StateError('配对服务已停止');
     }
-    return LoginPairSession(List.of(_urls!));
+    final urls = [for (final ip in addresses) 'http://$ip:$port/f/$token'];
+    if (urls.isEmpty) {
+      urls.add('http://127.0.0.1:$port/f/$token');
+    }
+    _server = server;
+    _pending = pending;
+    _urls = urls;
+    return LoginPairSession(List.of(urls));
   }
 
-  static Future<Response> _handle(Request request) async {
+  static Future<Response> _handle(
+    Request request,
+    String token,
+    Completer<LoginCredentials?> pending,
+  ) async {
     final path = request.url.pathSegments;
     // 路径必须是 /f/<token>（网页）或 /f/<token>/submit（提交）。
-    if (path.length < 2 || path[0] != 'f' || path[1] != _token) {
+    if (path.length < 2 || path[0] != 'f' || path[1] != token) {
       return Response.notFound('Not found');
     }
     final isSubmit = path.length == 3 && path[2] == 'submit';
     if (request.method == 'GET' && path.length == 2) {
-      return Response.ok(_webHtml, headers: {
-        'content-type': 'text/html; charset=utf-8',
-        'cache-control': 'no-store',
-      });
+      return Response.ok(
+        _webHtml,
+        headers: {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'no-store',
+        },
+      );
     }
     if (request.method == 'POST' && isSubmit) {
-      if (_consumed) {
+      if (pending.isCompleted) {
         return Response(410, body: '已消费，请重新生成二维码');
       }
       final raw = await request.readAsString();
@@ -100,8 +128,7 @@ class LoginPairServer {
             creds.password.isEmpty) {
           return Response.badRequest(body: '服务器地址、用户名与密码为必填项');
         }
-        _consumed = true;
-        if (!_pending!.isCompleted) _pending!.complete(creds);
+        pending.complete(creds);
         return Response.ok('ok');
       } catch (_) {
         return Response.badRequest(body: '请求格式错误');
@@ -117,12 +144,16 @@ class LoginPairServer {
 
   /// 停止服务（幂等）。页面 dispose 时调用。
   static void stop() {
+    _generation++;
+    _startFuture = null;
     _server?.close(force: true);
+    final pending = _pending;
+    if (pending != null && !pending.isCompleted) {
+      pending.complete(null);
+    }
     _server = null;
-    _token = null;
     _urls = null;
     _pending = null;
-    _consumed = false;
   }
 
   static String _generateToken() {

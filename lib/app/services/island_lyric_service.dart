@@ -109,7 +109,7 @@ class IslandLyricService {
   }
 
   /// 进度更新节流：同一首歌内，两次进度驱动发送的最小间隔。
-  static const Duration _progressThrottle = Duration(milliseconds: 500);
+  static const Duration _progressThrottle = Duration(seconds: 1);
 
   /// 测试模式模拟发送间隔。
   static const Duration _testModeInterval = Duration(milliseconds: 800);
@@ -473,7 +473,10 @@ class IslandLyricService {
 
     // 把字词文本拼接，用其累积字符长度映射到 frames 的字符边界。
     // 帧按字符切：累计到当前字的字符数占总字符数的比例 → 帧索引。
-    final totalChars = words.fold<int>(0, (sum, w) => sum + w.text.runes.length);
+    final totalChars = words.fold<int>(
+      0,
+      (sum, w) => sum + w.text.runes.length,
+    );
     if (totalChars <= 0) {
       return frameIndexForPosition(
         frameCount: frames.length,
@@ -501,7 +504,11 @@ class IslandLyricService {
     if (!enabled) return;
     final isPlaying = PlayerService.instance.isPlaying.value;
     final lyricLine = LyricsService.instance.currentLineText.value;
-    if (!shouldShow(enabled: true, isPlaying: isPlaying, lyricLine: lyricLine)) {
+    if (!shouldShow(
+      enabled: true,
+      isPlaying: isPlaying,
+      lyricLine: lyricLine,
+    )) {
       return;
     }
     if (_lastLyricLine == null) return; // 当前未在显示，无需刷进度
@@ -510,7 +517,8 @@ class IslandLyricService {
     // 这样「旧梦前尘 一去不回」这类长行会随进度推进显示后半段。
     // 有逐字时间戳时用字级进度精确推进，避免等分错位导致"唱完了才翻帧"。
     final isLive =
-        IslandLyricSettings.notificationType.value == IslandLyricSettings.typeLive;
+        IslandLyricSettings.notificationType.value ==
+        IslandLyricSettings.typeLive;
     final frames = chunkLyric(
       _lastLyricLine!,
       frameChars: isLive ? _liveMaxChars : _frameChars,
@@ -641,7 +649,8 @@ class IslandLyricService {
     if (lyricLine == null) return;
 
     final isLive =
-        IslandLyricSettings.notificationType.value == IslandLyricSettings.typeLive;
+        IslandLyricSettings.notificationType.value ==
+        IslandLyricSettings.typeLive;
     // 超长歌词按容量智能截断（空格优先断点）：实时 7 字、焦点 10 字。
     // 多帧时按播放位置推进（_lastFrameIndex，由 _onPositionChanged 更新），
     // 让「旧梦前尘 一去不回」这类长行能推进显示后半段。
@@ -718,6 +727,7 @@ class IslandLyricService {
       'bypassFocusLimit': IslandLyricSettings.bypassFocusLimit.value,
     };
   }
+
   /// 当前歌词行的时间窗口 + 逐字时间戳。无歌词模型时返回兜底。
   static (int, int?, List<fl.LyricWord>?) _currentLineWords() {
     final model = LyricsService.instance.snapshot.value.model;
@@ -726,11 +736,7 @@ class IslandLyricService {
       return (0, null, null);
     }
     final line = model.lines[index];
-    return (
-      line.start.inMilliseconds,
-      line.end?.inMilliseconds,
-      line.words,
-    );
+    return (line.start.inMilliseconds, line.end?.inMilliseconds, line.words);
   }
 }
 
@@ -782,7 +788,8 @@ class IslandCapabilities {
       supportIsland: supportIsland,
       focusProtocol: focusProtocol,
       focusPermission: focusPermission,
-      focusEnabled: readBool(raw['focusEnabled']) ||
+      focusEnabled:
+          readBool(raw['focusEnabled']) ||
           (focusProtocol >= 2 && focusPermission),
       androidSdk: readInt(raw['androidSdk']),
     );

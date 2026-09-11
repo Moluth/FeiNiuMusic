@@ -147,11 +147,29 @@ class _ConnectionFailedActionState extends State<_ConnectionFailedAction>
     _wifiController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1600),
-    )..repeat();
+    );
+    AppFnConnectionSettings.serverConnected.addListener(_syncWifiAnimation);
+    FnConnectionProbeService.instance.isProbing.addListener(_syncWifiAnimation);
+    _syncWifiAnimation();
+  }
+
+  void _syncWifiAnimation() {
+    final shouldAnimate =
+        !AppFnConnectionSettings.serverConnected.value &&
+        FnConnectionProbeService.instance.isProbing.value;
+    if (shouldAnimate) {
+      if (!_wifiController.isAnimating) _wifiController.repeat();
+    } else if (_wifiController.isAnimating) {
+      _wifiController.stop();
+    }
   }
 
   @override
   void dispose() {
+    AppFnConnectionSettings.serverConnected.removeListener(_syncWifiAnimation);
+    FnConnectionProbeService.instance.isProbing.removeListener(
+      _syncWifiAnimation,
+    );
     _wifiController.dispose();
     super.dispose();
   }
@@ -182,8 +200,7 @@ class _ConnectionFailedActionState extends State<_ConnectionFailedAction>
               icon = AnimatedBuilder(
                 animation: _wifiController,
                 builder: (context, _) {
-                  final level = (_wifiController.value *
-                          _wifiLevelIcons.length)
+                  final level = (_wifiController.value * _wifiLevelIcons.length)
                       .floor()
                       .clamp(0, _wifiLevelIcons.length - 1);
                   return Icon(

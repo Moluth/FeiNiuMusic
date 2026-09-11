@@ -15,7 +15,10 @@ import '../../../app/utils/route_visibility.dart';
 @visibleForTesting
 int dynamicGradientFramesPerSecond(TargetPlatform platform) {
   return switch (platform) {
-    TargetPlatform.macOS || TargetPlatform.windows || TargetPlatform.linux => 8,
+    TargetPlatform.android ||
+    TargetPlatform.macOS ||
+    TargetPlatform.windows ||
+    TargetPlatform.linux => 8,
     _ => 15,
   };
 }
@@ -432,12 +435,13 @@ class _DynamicGradientBackground extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return switch (defaultTargetPlatform) {
-      TargetPlatform.macOS || TargetPlatform.windows || TargetPlatform.linux =>
-        _TextureGradientBackground(
-          baseColor: baseColor,
-          saturation: saturation,
-          hueShift: hueShift,
-        ),
+      TargetPlatform.macOS ||
+      TargetPlatform.windows ||
+      TargetPlatform.linux => _TextureGradientBackground(
+        baseColor: baseColor,
+        saturation: saturation,
+        hueShift: hueShift,
+      ),
       _ => _VectorGradientBackground(
         baseColor: baseColor,
         saturation: saturation,

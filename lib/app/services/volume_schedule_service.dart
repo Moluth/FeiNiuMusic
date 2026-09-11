@@ -23,7 +23,7 @@ class VolumeScheduleService {
 
   bool get isActive => _active != null;
 
-  /// 幂等启动：App 启动时调用一次。加载设置、立即应用一次、启动 30s 心跳。
+  /// 幂等启动：App 启动时调用一次。加载设置、立即应用一次、调度下个边界。
   Future<void> ensureStarted() async {
     if (_started) return;
     _started = true;
@@ -32,7 +32,7 @@ class VolumeScheduleService {
     _restartTickerIfNeeded();
   }
 
-  /// 立即重检一次（生命周期 resume、手动音量变化、tick）。
+  /// 立即重检一次（生命周期 resume、手动音量变化、边界定时器）。
   void checkNow() {
     unawaited(_applySchedule());
   }
@@ -43,7 +43,7 @@ class VolumeScheduleService {
     await _applySchedule(now: now);
   }
 
-  /// 关闭心跳并释放监听（仅在测试/热重载时触发；App 进程生命周期内不调用）。
+  /// 关闭边界定时器并释放监听（仅在测试/热重载时触发）。
   /// 同时重置生效状态，保证单例可被测试复用而不残留上个用例的时段。
   void dispose() {
     _ticker?.cancel();
@@ -130,20 +130,41 @@ class VolumeScheduleService {
     unawaited(_applySchedule(forceApply: true));
   }
 
-  // ---------- 心跳 ----------
+  // ---------- 边界调度 ----------
 
-  /// 仅在开关开启或存在生效时间段时运行 30s 心跳，否则取消以省电。
-  ///
-  /// 心跳只作为「跨越时间段边界」的兜底（进入/离开时段最迟 30s 内应用），
-  /// 段内音量/手动调节不受影响；resume 时 checkNow 会立即重检，不依赖心跳精度。
+  /// 只唤醒到下一个开始/结束边界；resume 时 [checkNow] 会立即纠正挂起期间
+  /// 跨过的边界，因此无需全天运行固定周期心跳。
   void _restartTickerIfNeeded() {
-    final shouldRun = AppVolumeScheduleSettings.enabled.value || _active != null;
-    if (shouldRun) {
-      if (_ticker != null) return;
-      _ticker = Timer.periodic(const Duration(seconds: 30), (_) => checkNow());
-    } else {
-      _ticker?.cancel();
-      _ticker = null;
+    _ticker?.cancel();
+    _ticker = null;
+    final shouldRun =
+        AppVolumeScheduleSettings.enabled.value &&
+        AppVolumeScheduleSettings.periods.value.isNotEmpty;
+    if (!shouldRun) return;
+
+    final now = DateTime.now();
+    DateTime? nextBoundary;
+    for (final period in AppVolumeScheduleSettings.periods.value) {
+      for (final minute in [period.startMin, period.endMin]) {
+        var candidate = DateTime(
+          now.year,
+          now.month,
+          now.day,
+          minute ~/ 60,
+          minute % 60,
+        );
+        if (!candidate.isAfter(now)) {
+          candidate = candidate.add(const Duration(days: 1));
+        }
+        if (nextBoundary == null || candidate.isBefore(nextBoundary)) {
+          nextBoundary = candidate;
+        }
+      }
     }
+    if (nextBoundary == null) return;
+    _ticker = Timer(nextBoundary.difference(now), () {
+      _ticker = null;
+      checkNow();
+    });
   }
 }

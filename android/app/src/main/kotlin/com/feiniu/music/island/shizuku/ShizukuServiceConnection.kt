@@ -139,7 +139,7 @@ object ShizukuServiceConnection {
                         PrivilegedServiceImpl::class.java.name
                     )
                 )
-                    .daemon(true)
+                    .daemon(false)
                     .processNameSuffix("privileged")
                     .version(2)
 
@@ -177,6 +177,26 @@ object ShizukuServiceConnection {
         } catch (e: Throwable) {
             Log.e(TAG, "executeWithService 执行失败: ${e.message}", e)
             throw e
+        }
+    }
+
+    suspend fun release() {
+        serviceMutex.withLock {
+            val args = serviceArgs
+            val connection = serviceConnection
+            runCatching { cachedService?.setLogCallback(null) }
+            cachedService = null
+            serviceConnection = null
+            serviceArgs = null
+            lastPingAttempt = 0L
+            if (args != null && connection != null) {
+                try {
+                    Shizuku.unbindUserService(args, connection, true)
+                    Log.d(TAG, "Service 连接已释放")
+                } catch (e: Throwable) {
+                    Log.w(TAG, "释放 Service 连接失败: ${e.message}")
+                }
+            }
         }
     }
 }

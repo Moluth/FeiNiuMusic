@@ -59,8 +59,7 @@ class DlnaCastService {
   final ValueNotifier<List<DlnaDevice>> devices = ValueNotifier(const []);
 
   /// 投屏状态（idle / discovering / casting）。
-  final ValueNotifier<DlnaCastState> state =
-      ValueNotifier(DlnaCastState.idle);
+  final ValueNotifier<DlnaCastState> state = ValueNotifier(DlnaCastState.idle);
 
   /// 当前投屏目标设备。
   final ValueNotifier<DlnaDevice?> currentDevice = ValueNotifier(null);
@@ -96,6 +95,9 @@ class DlnaCastService {
   final ValueNotifier<bool> castPlaying = ValueNotifier(false);
 
   Timer? _positionPollTimer;
+  bool _positionPollInFlight = false;
+  Future<void> _loadSongChain = Future<void>.value();
+  int _loadSongGeneration = 0;
 
   /// 上一帧轮询的投屏设备位置（秒）。用于播完检测（位置到达时长且不再前进）。
   int _lastPollPositionSeconds = -1;
@@ -298,10 +300,7 @@ class DlnaCastService {
   ///   HLS（渲染器可解码）；失败退直连；
   /// - 其余（MP3/AAC/…）→ 直连流。
   /// 统一经 [MediaStreamProxy] 换签为匿名 URL。
-  Future<bool> castTo(
-    DlnaDevice device,
-    SongEntity song,
-  ) async {
+  Future<bool> castTo(DlnaDevice device, SongEntity song) async {
     if (!DlnaCastSettings.enabled.value) return false;
     try {
       await _ensureInitialized();
@@ -326,19 +325,13 @@ class DlnaCastService {
         album: song.albumDisplayName.trim().isEmpty
             ? null
             : song.albumDisplayName.trim(),
-        albumArtUri: coverProxyUrl == null
-            ? null
-            : Url(value: coverProxyUrl),
+        albumArtUri: coverProxyUrl == null ? null : Url(value: coverProxyUrl),
         duration: song.durationMs != null && song.durationMs! > 0
             ? TimeDuration(seconds: (song.durationMs! / 1000).round())
             : null,
       );
 
-      await _api.setMediaUri(
-        device.udn,
-        Url(value: proxyUrl),
-        metadata,
-      );
+      await _api.setMediaUri(device.udn, Url(value: proxyUrl), metadata);
       await _api.play(device.udn);
 
       currentDevice.value = device;
@@ -359,11 +352,19 @@ class DlnaCastService {
       unawaited(_setNativeVolumeCapture(true));
       onCastStart?.call();
       if (kDebugMode) {
-        debugPrint('[DlnaCastService] cast ${song.title} -> ${device.friendlyName}');
+        debugPrint(
+          '[DlnaCastService] cast ${song.title} -> ${device.friendlyName}',
+        );
       }
       return true;
     } catch (e) {
       if (kDebugMode) debugPrint('[DlnaCastService] castTo failed: $e');
+      _stopPositionPoll();
+      await MediaStreamProxy.instance.stop();
+      currentDevice.value = null;
+      castPlaying.value = false;
+      castPosition.value = Duration.zero;
+      state.value = DlnaCastState.idle;
       return false;
     }
   }
@@ -403,7 +404,10 @@ class DlnaCastService {
   Future<String?> _resolveCastCover(SongEntity song) async {
     final coverId = song.coverId;
     if (coverId == null || coverId.isEmpty) return null;
-    final coverUrl = FeiNiuApiClient.instance.coverUrl(coverId, size: FeiNiuApiClient.coverRequestSize);
+    final coverUrl = FeiNiuApiClient.instance.coverUrl(
+      coverId,
+      size: FeiNiuApiClient.coverRequestSize,
+    );
     return MediaStreamProxy.instance.registerResource(
       coverUrl,
       headers: FeiNiuApiClient.imageAuthHeaders(),
@@ -446,10 +450,7 @@ class DlnaCastService {
     final device = currentDevice.value;
     if (device == null) return;
     try {
-      await _api.seek(
-        device.udn,
-        TimePosition(seconds: position.inSeconds),
-      );
+      await _api.seek(device.udn, TimePosition(seconds: position.inSeconds));
     } catch (e) {
       if (kDebugMode) debugPrint('[DlnaCastService] seek failed: $e');
     }
@@ -470,16 +471,32 @@ class DlnaCastService {
   }
 
   /// 在投屏设备上切换歌曲（换一条媒体流继续播）。
-  Future<void> loadSong(SongEntity song) async {
+  Future<void> loadSong(SongEntity song) {
+    final generation = ++_loadSongGeneration;
+    _loadSongChain = _loadSongChain.then((_) async {
+      if (generation != _loadSongGeneration) return;
+      await _loadSong(song, generation);
+    });
+    return _loadSongChain;
+  }
+
+  Future<void> _loadSong(SongEntity song, int generation) async {
     final device = currentDevice.value;
     if (device == null) return;
-    // 上一首的封面资源已不再需要，先清空避免泄漏（媒体流走 registerMedia，
-    // 不受 _resources 影响）。
-    MediaStreamProxy.instance.unregisterResources();
-    final proxyUrl = await _resolveCastUrl(song);
-    if (proxyUrl == null) return;
-    final coverProxyUrl = await _resolveCastCover(song);
     try {
+      // 上一首的封面资源已不再需要，先清空避免泄漏（媒体流走 registerMedia，
+      // 不受 _resources 影响）。
+      MediaStreamProxy.instance.unregisterResources();
+      final proxyUrl = await _resolveCastUrl(song);
+      if (proxyUrl == null ||
+          generation != _loadSongGeneration ||
+          currentDevice.value != device) {
+        return;
+      }
+      final coverProxyUrl = await _resolveCastCover(song);
+      if (generation != _loadSongGeneration || currentDevice.value != device) {
+        return;
+      }
       await _api.setMediaUri(
         device.udn,
         Url(value: proxyUrl),
@@ -488,9 +505,7 @@ class DlnaCastService {
           artist: song.artistDisplayName.trim().isEmpty
               ? null
               : song.artistDisplayName.trim(),
-          albumArtUri: coverProxyUrl == null
-              ? null
-              : Url(value: coverProxyUrl),
+          albumArtUri: coverProxyUrl == null ? null : Url(value: coverProxyUrl),
         ),
       );
       await _api.play(device.udn);
@@ -513,6 +528,7 @@ class DlnaCastService {
   /// [reason] 非空时向 UI 提示（设备离线等）。[silent] 为 true 时不触发
   /// `onCastDisconnect`（切换投屏设备时用，避免本机短暂恢复出声）。
   Future<void> disconnect({String? reason, bool silent = false}) async {
+    _loadSongGeneration++;
     final wasCasting = isCasting;
     await stopDiscovery();
     _stopPositionPoll();
@@ -551,8 +567,10 @@ class DlnaCastService {
   void _startPositionPoll() {
     _positionPollTimer?.cancel();
     _positionPollTimer = Timer.periodic(const Duration(seconds: 1), (_) async {
+      if (_positionPollInFlight) return;
       final device = currentDevice.value;
       if (device == null) return;
+      _positionPollInFlight = true;
       try {
         final info = await _api.getPlaybackInfo(device.udn);
         if (currentDevice.value == null) return; // 已断开
@@ -581,8 +599,7 @@ class DlnaCastService {
 
         // ---- 播完 / 停止检测 ----
         final reachedEnd = effectiveDur > 0 && posSec >= effectiveDur;
-        final wasNearEnd =
-            effectiveDur > 0 && prevPos >= effectiveDur * 0.9;
+        final wasNearEnd = effectiveDur > 0 && prevPos >= effectiveDur * 0.9;
 
         var completed = false;
         if (reachedEnd) {
@@ -644,6 +661,8 @@ class DlnaCastService {
           }
           unawaited(disconnect(reason: null));
         }
+      } finally {
+        _positionPollInFlight = false;
       }
     });
   }

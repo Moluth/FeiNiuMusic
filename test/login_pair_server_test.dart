@@ -85,4 +85,20 @@ void main() {
     LoginPairServer.stop();
     LoginPairServer.stop(); // 不抛
   });
+
+  test('stop 会结束等待中的登录任务', () async {
+    await LoginPairServer.start();
+    final pending = LoginPairServer.waitForLogin();
+    LoginPairServer.stop();
+    expect(await pending, isNull);
+  });
+
+  test('并发 start 复用同一个配对服务', () async {
+    final sessions = await Future.wait([
+      LoginPairServer.start(),
+      LoginPairServer.start(),
+      LoginPairServer.start(),
+    ]);
+    expect(sessions.map((session) => session.urls.first).toSet(), hasLength(1));
+  });
 }
