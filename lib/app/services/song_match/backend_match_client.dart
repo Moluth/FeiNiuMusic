@@ -57,8 +57,9 @@ class SearchSourceInfo {
       capabilities: (json['capabilities'] as List? ?? const [])
           .map((e) => e.toString())
           .toList(),
-      searchTypes: (json['searchTypes'] as Map? ?? const {})
-          .map((k, v) => MapEntry(k.toString(), (v as num?)?.toInt() ?? 0)),
+      searchTypes: (json['searchTypes'] as Map? ?? const {}).map(
+        (k, v) => MapEntry(k.toString(), (v as num?)?.toInt() ?? 0),
+      ),
       defaultSearchType: (json['defaultSearchType'] as num?)?.toInt() ?? 0,
       config: (json['config'] as Map?)?.cast<String, dynamic>() ?? const {},
     );
@@ -291,17 +292,15 @@ class BackendMatchClient {
       final pluginName = g['pluginName']?.toString() ?? '';
       final items = g['items'];
       if (pluginId.isEmpty || items is! List) continue;
-      final results = parseSongResults(
-        jsonEncode(items),
-        pluginId,
-        pluginName,
-      );
+      final results = parseSongResults(jsonEncode(items), pluginId, pluginName);
       if (results.isEmpty) continue;
-      groups.add(SourceGroup(
-        pluginId: pluginId,
-        pluginName: pluginName,
-        results: results,
-      ));
+      groups.add(
+        SourceGroup(
+          pluginId: pluginId,
+          pluginName: pluginName,
+          results: results,
+        ),
+      );
     }
     return GroupedSongResults(groups: groups);
   }
@@ -411,8 +410,9 @@ class BackendMatchClient {
       original: parseStructuredLines(payload['original']),
       translated: parseStructuredLines(payload['translated']),
       romanization: parseStructuredLines(payload['romanization']),
-      tags: (payload['tags'] as Map? ?? const {})
-          .map((k, v) => MapEntry(k.toString(), v?.toString() ?? '')),
+      tags: (payload['tags'] as Map? ?? const {}).map(
+        (k, v) => MapEntry(k.toString(), v?.toString() ?? ''),
+      ),
     );
     return result.hasLyrics ? result : null;
   }
@@ -447,6 +447,10 @@ class BackendMatchClient {
         },
         options: Options(
           headers: {..._authHeaders(), 'Content-Type': 'application/json'},
+          // 服务端会逐首访问第三方数据源并写回 NAS，不能沿用普通搜索的
+          // 30 秒超时；与全库批量刷新使用相同的长任务预算。
+          sendTimeout: const Duration(minutes: 1),
+          receiveTimeout: const Duration(minutes: 10),
         ),
       );
       data = response.data ?? const {};
@@ -515,18 +519,14 @@ class BackendMatchClient {
   }
 
   /// 批量刷新所有歌手图片（高危：遍历歌手搜索封面+新 guid 删旧）。
-  Future<RefreshBatchResult> refreshArtistCovers({
-    List<String>? sources,
-  }) {
+  Future<RefreshBatchResult> refreshArtistCovers({List<String>? sources}) {
     return _refresh(_matchRefreshArtistCoversPath, {
       if (sources != null) 'sources': sources,
     });
   }
 
   /// 批量刷新所有专辑图片（高危：遍历专辑搜索封面+新 guid 删旧）。
-  Future<RefreshBatchResult> refreshAlbumCovers({
-    List<String>? sources,
-  }) {
+  Future<RefreshBatchResult> refreshAlbumCovers({List<String>? sources}) {
     return _refresh(_matchRefreshAlbumCoversPath, {
       if (sources != null) 'sources': sources,
     });

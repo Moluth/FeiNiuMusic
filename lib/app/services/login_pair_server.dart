@@ -142,11 +142,12 @@ class LoginPairServer {
     return _pending?.future ?? Future<LoginCredentials?>.value();
   }
 
-  /// 停止服务（幂等）。页面 dispose 时调用。
-  static void stop() {
+  /// 停止服务（幂等）。调用方可等待 socket 与其内部定时器彻底释放。
+  static Future<void> stop() async {
     _generation++;
+    final startFuture = _startFuture;
+    final server = _server;
     _startFuture = null;
-    _server?.close(force: true);
     final pending = _pending;
     if (pending != null && !pending.isCompleted) {
       pending.complete(null);
@@ -154,6 +155,14 @@ class LoginPairServer {
     _server = null;
     _urls = null;
     _pending = null;
+    await server?.close(force: true);
+    if (startFuture != null) {
+      try {
+        await startFuture;
+      } catch (_) {
+        // stop 使启动代次失效时，_start 会自行关闭刚创建的 server 并抛错。
+      }
+    }
   }
 
   static String _generateToken() {

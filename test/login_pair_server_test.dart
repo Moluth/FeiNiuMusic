@@ -82,14 +82,14 @@ void main() {
 
   test('stop 幂等', () async {
     await LoginPairServer.start();
-    LoginPairServer.stop();
-    LoginPairServer.stop(); // 不抛
+    await LoginPairServer.stop();
+    await LoginPairServer.stop(); // 不抛
   });
 
   test('stop 会结束等待中的登录任务', () async {
     await LoginPairServer.start();
     final pending = LoginPairServer.waitForLogin();
-    LoginPairServer.stop();
+    await LoginPairServer.stop();
     expect(await pending, isNull);
   });
 

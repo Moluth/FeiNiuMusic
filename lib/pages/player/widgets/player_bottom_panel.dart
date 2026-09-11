@@ -16,6 +16,7 @@ import '../../../components/common/labeled_slider.dart';
 import '../../../components/common/playing_bars.dart';
 import '../../../components/feedback/app_toast.dart';
 import '../../../components/player/lyric_preview.dart';
+import '../../../components/player/player_favorite_button.dart';
 import '../../library/library_detail_pages.dart';
 import '../../songs/song_detail_sheet.dart';
 import 'player_background.dart';
@@ -481,7 +482,8 @@ class BottomActions extends StatelessWidget {
                         children: [
                           IconButton(
                             icon: Icon(Icons.alarm, color: iconColor),
-                            onPressed: () => _showSleepTimerSheet(context),
+                            onPressed: () =>
+                                showPlayerSleepTimerSheet(context, player),
                           ),
                           if (text != null)
                             Positioned(
@@ -499,6 +501,9 @@ class BottomActions extends StatelessWidget {
                       ),
                     );
                   }
+                  actions.add(
+                    PlayerFavoriteButton(song: player.currentSongSignal.value),
+                  );
                   break;
                 case 'playlist':
                   if (PlayerBottomActionSettings.showPlaylist.value) {
@@ -531,22 +536,13 @@ class BottomActions extends StatelessWidget {
             return Padding(
               padding: const EdgeInsets.symmetric(horizontal: 20),
               child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                 children: actions,
               ),
             );
           },
         );
       },
-    );
-  }
-
-  void _showSleepTimerSheet(BuildContext context) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: Colors.transparent,
-      isScrollControlled: true,
-      builder: (_) => _SleepTimerSheet(player: player),
     );
   }
 
@@ -594,6 +590,66 @@ class BottomActions extends StatelessWidget {
       ),
     );
   }
+}
+
+class PosterBottomActions extends StatelessWidget {
+  final PlayerService player;
+
+  const PosterBottomActions({super.key, required this.player});
+
+  @override
+  Widget build(BuildContext context) {
+    final iconColor = Theme.of(
+      context,
+    ).colorScheme.onSurface.withValues(alpha: 0.72);
+    return Watch.builder(
+      builder: (context) {
+        final timerText = player.sleepTimerDisplayTextSignal.value;
+        final song = player.currentSongSignal.value;
+        return Row(
+          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+          children: [
+            Stack(
+              alignment: Alignment.center,
+              clipBehavior: Clip.none,
+              children: [
+                IconButton(
+                  icon: Icon(Icons.alarm, color: iconColor),
+                  onPressed: () => showPlayerSleepTimerSheet(context, player),
+                ),
+                if (timerText != null)
+                  Positioned(
+                    bottom: -8,
+                    child: Text(
+                      timerText,
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold,
+                        color: iconColor.withValues(alpha: 0.8),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+            PlayerFavoriteButton(song: song),
+            IconButton(
+              icon: Icon(Icons.format_list_bulleted, color: iconColor),
+              onPressed: () => showPlayerPlaylistSheet(context, player),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+void showPlayerSleepTimerSheet(BuildContext context, PlayerService player) {
+  showModalBottomSheet(
+    context: context,
+    backgroundColor: Colors.transparent,
+    isScrollControlled: true,
+    builder: (_) => _SleepTimerSheet(player: player),
+  );
 }
 
 void showPlayerPlaylistSheet(BuildContext context, PlayerService player) {
@@ -1018,9 +1074,8 @@ class _PlaylistSheetState extends State<_PlaylistSheet> {
                                 return AnimatedBuilder(
                                   animation: animation,
                                   builder: (context, child) {
-                                    final animValue = Curves.easeInOut.transform(
-                                      animation.value,
-                                    );
+                                    final animValue = Curves.easeInOut
+                                        .transform(animation.value);
                                     final elevation = ui.lerpDouble(
                                       0,
                                       6,
@@ -1044,10 +1099,7 @@ class _PlaylistSheetState extends State<_PlaylistSheet> {
                               // 处于 Watch.builder 内会被包装成 SignalEffectException）。
                               onReorderItem: (oldIndex, newIndex) {
                                 if (mode == PlaybackMode.shuffle) return;
-                                widget.player.reorderQueue(
-                                  oldIndex,
-                                  newIndex,
-                                );
+                                widget.player.reorderQueue(oldIndex, newIndex);
                               },
                               itemCount: total,
                               itemBuilder: (context, index) {
@@ -1068,11 +1120,10 @@ class _PlaylistSheetState extends State<_PlaylistSheet> {
                                     accent: scheme.primary,
                                     textColor: textColor,
                                     secondaryTextColor: secondaryTextColor,
-                                    onTap: () => widget.player.skipToIndex(
-                                      index,
-                                    ),
-                                    onRemove: () => widget.player
-                                        .removeFromQueue(index),
+                                    onTap: () =>
+                                        widget.player.skipToIndex(index),
+                                    onRemove: () =>
+                                        widget.player.removeFromQueue(index),
                                   ),
                                 );
                               },
@@ -1386,15 +1437,15 @@ class _QueueLimitDialog extends StatelessWidget {
                 const SizedBox(height: 8),
                 Slider(
                   value: limit.toDouble().clamp(
-                        AppPlaybackQueueSettings.minQueueLimit.toDouble(),
-                        AppPlaybackQueueSettings.maxQueueLimit.toDouble(),
-                      ),
+                    AppPlaybackQueueSettings.minQueueLimit.toDouble(),
+                    AppPlaybackQueueSettings.maxQueueLimit.toDouble(),
+                  ),
                   min: AppPlaybackQueueSettings.minQueueLimit.toDouble(),
                   max: AppPlaybackQueueSettings.maxQueueLimit.toDouble(),
                   divisions:
                       (AppPlaybackQueueSettings.maxQueueLimit -
-                              AppPlaybackQueueSettings.minQueueLimit) ~/
-                          10,
+                          AppPlaybackQueueSettings.minQueueLimit) ~/
+                      10,
                   label: '$limit 首',
                   onChanged: (value) {
                     AppPlaybackQueueSettings.setMaxQueueLength(value.round());

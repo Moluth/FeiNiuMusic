@@ -10,6 +10,7 @@ import '../../../app/services/lyrics/lyrics_view_colors.dart';
 import '../../../app/services/player_service.dart';
 import '../../../app/state/settings_state.dart';
 import '../../../components/index.dart';
+import '../../../components/player/player_favorite_button.dart';
 import '../widgets/player_bottom_panel.dart';
 import 'widgets/lyrics_actions_bar.dart';
 import 'widgets/lyrics_drag_to_seek.dart';
@@ -589,222 +590,240 @@ class _PlayerLyricsViewState extends State<PlayerLyricsView> with SignalsMixin {
                         ],
                 ).createShader(rect),
                 child: LyricsDragToSeek(
-                    enabled: dragLyrics,
-                    player: player,
-                    lyrics: lyrics,
-                    child: () {
-                      final hasLines = model?.lines.isNotEmpty ?? false;
-                      if (snap.status == LyricsLoadStatus.loading &&
-                          !hasLines) {
-                        return const SizedBox.shrink();
-                      }
-                      if (!hasLines) {
-                        return Center(
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Text(
-                                '暂无歌词',
-                                style: TextStyle(
-                                  fontSize: 16,
-                                  color: onSurface.withValues(alpha: 0.8),
-                                ),
-                              ),
-                              const SizedBox(height: 8),
-                              Text(
-                                '纯音乐或未匹配到歌词',
-                                style: TextStyle(
-                                  fontSize: 14,
-                                  color: onSurface.withValues(alpha: 0.6),
-                                ),
-                              ),
-                            ],
-                          ),
-                        );
-                      }
-                      final hasKaraokeWords = model!.lines.any(
-                        (line) => line.words?.isNotEmpty ?? false,
-                      );
-                      final karaokeMode = forceKaraoke || hasKaraokeWords;
-                      final inactiveColor =
-                          LyricsViewColors.customColorOrDefault(
-                            _inactiveColorValue.value,
-                            LyricsViewColors.defaultInactiveColor(context),
-                          );
-                      final activeColor = LyricsViewColors.customColorOrDefault(
-                        _activeColorValue.value,
-                        LyricsViewColors.defaultActiveColor(context),
-                      );
-                      final highlightColor =
-                          LyricsViewColors.customColorOrDefault(
-                            _highlightColorValue.value,
-                            LyricsViewColors.defaultHighlightColor(context),
-                          );
-                      final isLight = theme.brightness == Brightness.light;
-                      final karaokeBaseColor =
-                          LyricsViewColors.karaokeBaseColor(
-                            context,
-                            inactiveColor: inactiveColor,
-                          );
-
-                      final translationStyle = showTranslation
-                          ? TextStyle(
-                              color: isLight
-                                  ? const Color(0xFF7A7A7A)
-                                  : onSurface.withValues(alpha: 0.35),
-                              fontSize: fontSize * 0.85,
-                              height: 1.2,
-                            )
-                          : const TextStyle(
-                              color: Colors.transparent,
-                              fontSize: 0,
-                              height: 0,
-                            );
-
-                      final style = LyricStyle(
-                        textStyle: TextStyle(
-                          color: inactiveColor,
-                          fontSize: fontSize,
-                          height: 1.3,
-                        ),
-                        activeStyle: TextStyle(
-                          color: karaokeMode ? karaokeBaseColor : activeColor,
-                          fontSize: activeFontSize,
-                          fontWeight: FontWeight.w700,
-                          height: 1.3,
-                        ),
-                        translationStyle: translationStyle,
-                        translationActiveColor: showTranslation
-                            ? onSurface.withValues(alpha: 0.9)
-                            : Colors.transparent,
-                        lineTextAlign: _lineTextAlign(),
-                        contentAlignment: _contentAlignment(),
-                        contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 24,
-                          vertical: 12,
-                        ),
-                        lineGap: lineGap,
-                        translationLineGap: showTranslation ? 8 : 0,
-                        selectionAnchorPosition: 0.5,
-                        activeAnchorPosition: 0.5,
-                        selectionAlignment: MainAxisAlignment.center,
-                        activeAlignment: MainAxisAlignment.center,
-                        scrollDuration: const Duration(milliseconds: 380),
-                        scrollCurve: Curves.easeOutCubic,
-                        selectedColor: activeColor,
-                        selectedTranslationColor: onSurface.withValues(
-                          alpha: 0.9,
-                        ),
-                        selectionAutoResumeDuration: const Duration(
-                          milliseconds: 200,
-                        ),
-                        activeAutoResumeDuration: isPlaying
-                            ? const Duration(seconds: 3)
-                            : const Duration(days: 365),
-                        disableTouchEvent: !dragLyrics,
-                        enableSwitchAnimation: false,
-                        activeHighlightGradient: karaokeMode
-                            ? LinearGradient(
-                                colors: [
-                                  highlightColor.withValues(alpha: 1.0),
-                                  highlightColor.withValues(alpha: 1.0),
-                                ],
-                              )
-                            : null,
-                        activeHighlightExtraFadeWidth: 0,
-                      );
-                      return Stack(
-                        children: [
-                          fl.LyricView(
-                            controller: lyrics.controller,
-                            style: style,
-                          ),
-                          if (!dragLyrics || !selecting)
-                            const SizedBox.shrink()
-                          else
-                            Align(
-                              alignment: Alignment.center,
-                              child: Padding(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 16,
-                                ),
-                                child: SizedBox(
-                                  height: 44,
-                                  child: () {
-                                    final m = model;
-                                    final showDetails =
-                                        index >= 0 && index < m.lines.length;
-                                    final timeText = showDetails
-                                        ? "${m.lines[index].start.inMinutes.toString().padLeft(2, '0')}:${(m.lines[index].start.inSeconds % 60).toString().padLeft(2, '0')}"
-                                        : '';
-                                    return Row(
-                                      children: [
-                                        if (showDetails)
-                                          Text(
-                                            timeText,
-                                            style: TextStyle(
-                                              color: activeColor,
-                                              fontSize: 15,
-                                              fontWeight: FontWeight.w500,
-                                            ),
-                                          ),
-                                        if (showDetails)
-                                          const SizedBox(width: 8),
-                                        Expanded(
-                                          child: Container(
-                                            height: 1,
-                                            color: centered
-                                                ? Colors.transparent
-                                                : onSurface.withValues(
-                                                    alpha: 0.25,
-                                                  ),
-                                          ),
-                                        ),
-                                        if (showDetails)
-                                          const SizedBox(width: 8),
-                                        if (showDetails && dragSeek)
-                                          GestureDetector(
-                                            behavior: HitTestBehavior.opaque,
-                                            onTap: () {
-                                              if (index < 0 ||
-                                                  index >= m.lines.length) {
-                                                return;
-                                              }
-                                              final start =
-                                                  m.lines[index].start;
-                                              lyrics.controller.stopSelection();
-                                              player.seek(start);
-                                            },
-                                            child: Icon(
-                                              Icons.play_arrow_rounded,
-                                              size: 32,
-                                              color: activeColor,
-                                            ),
-                                          ),
-                                      ],
-                                    );
-                                  }(),
-                                ),
+                  enabled: dragLyrics,
+                  player: player,
+                  lyrics: lyrics,
+                  child: () {
+                    final hasLines = model?.lines.isNotEmpty ?? false;
+                    if (snap.status == LyricsLoadStatus.loading && !hasLines) {
+                      return const SizedBox.shrink();
+                    }
+                    if (!hasLines) {
+                      return Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              '暂无歌词',
+                              style: TextStyle(
+                                fontSize: 16,
+                                color: onSurface.withValues(alpha: 0.8),
                               ),
                             ),
-                        ],
+                            const SizedBox(height: 8),
+                            Text(
+                              '纯音乐或未匹配到歌词',
+                              style: TextStyle(
+                                fontSize: 14,
+                                color: onSurface.withValues(alpha: 0.6),
+                              ),
+                            ),
+                          ],
+                        ),
                       );
-                    }(),
-                  ),
+                    }
+                    final hasKaraokeWords = model!.lines.any(
+                      (line) => line.words?.isNotEmpty ?? false,
+                    );
+                    final karaokeMode = forceKaraoke || hasKaraokeWords;
+                    final inactiveColor = LyricsViewColors.customColorOrDefault(
+                      _inactiveColorValue.value,
+                      LyricsViewColors.defaultInactiveColor(context),
+                    );
+                    final activeColor = LyricsViewColors.customColorOrDefault(
+                      _activeColorValue.value,
+                      LyricsViewColors.defaultActiveColor(context),
+                    );
+                    final highlightColor =
+                        LyricsViewColors.customColorOrDefault(
+                          _highlightColorValue.value,
+                          LyricsViewColors.defaultHighlightColor(context),
+                        );
+                    final isLight = theme.brightness == Brightness.light;
+                    final karaokeBaseColor = LyricsViewColors.karaokeBaseColor(
+                      context,
+                      inactiveColor: inactiveColor,
+                    );
+
+                    final translationStyle = showTranslation
+                        ? TextStyle(
+                            color: isLight
+                                ? const Color(0xFF7A7A7A)
+                                : onSurface.withValues(alpha: 0.35),
+                            fontSize: fontSize * 0.85,
+                            height: 1.2,
+                          )
+                        : const TextStyle(
+                            color: Colors.transparent,
+                            fontSize: 0,
+                            height: 0,
+                          );
+
+                    final style = LyricStyle(
+                      textStyle: TextStyle(
+                        color: inactiveColor,
+                        fontSize: fontSize,
+                        height: 1.3,
+                      ),
+                      activeStyle: TextStyle(
+                        color: karaokeMode ? karaokeBaseColor : activeColor,
+                        fontSize: activeFontSize,
+                        fontWeight: FontWeight.w700,
+                        height: 1.3,
+                      ),
+                      translationStyle: translationStyle,
+                      translationActiveColor: showTranslation
+                          ? onSurface.withValues(alpha: 0.9)
+                          : Colors.transparent,
+                      lineTextAlign: _lineTextAlign(),
+                      contentAlignment: _contentAlignment(),
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 24,
+                        vertical: 12,
+                      ),
+                      lineGap: lineGap,
+                      translationLineGap: showTranslation ? 8 : 0,
+                      selectionAnchorPosition: 0.5,
+                      activeAnchorPosition: 0.5,
+                      selectionAlignment: MainAxisAlignment.center,
+                      activeAlignment: MainAxisAlignment.center,
+                      scrollDuration: const Duration(milliseconds: 380),
+                      scrollCurve: Curves.easeOutCubic,
+                      selectedColor: activeColor,
+                      selectedTranslationColor: onSurface.withValues(
+                        alpha: 0.9,
+                      ),
+                      selectionAutoResumeDuration: const Duration(
+                        milliseconds: 200,
+                      ),
+                      activeAutoResumeDuration: isPlaying
+                          ? const Duration(seconds: 3)
+                          : const Duration(days: 365),
+                      disableTouchEvent: !dragLyrics,
+                      enableSwitchAnimation: false,
+                      activeHighlightGradient: karaokeMode
+                          ? LinearGradient(
+                              colors: [
+                                highlightColor.withValues(alpha: 1.0),
+                                highlightColor.withValues(alpha: 1.0),
+                              ],
+                            )
+                          : null,
+                      activeHighlightExtraFadeWidth: 0,
+                    );
+                    return Stack(
+                      children: [
+                        fl.LyricView(
+                          controller: lyrics.controller,
+                          style: style,
+                        ),
+                        if (!dragLyrics || !selecting)
+                          const SizedBox.shrink()
+                        else
+                          Align(
+                            alignment: Alignment.center,
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 16,
+                              ),
+                              child: SizedBox(
+                                height: 44,
+                                child: () {
+                                  final m = model;
+                                  final showDetails =
+                                      index >= 0 && index < m.lines.length;
+                                  final timeText = showDetails
+                                      ? "${m.lines[index].start.inMinutes.toString().padLeft(2, '0')}:${(m.lines[index].start.inSeconds % 60).toString().padLeft(2, '0')}"
+                                      : '';
+                                  return Row(
+                                    children: [
+                                      if (showDetails)
+                                        Text(
+                                          timeText,
+                                          style: TextStyle(
+                                            color: activeColor,
+                                            fontSize: 15,
+                                            fontWeight: FontWeight.w500,
+                                          ),
+                                        ),
+                                      if (showDetails) const SizedBox(width: 8),
+                                      Expanded(
+                                        child: Container(
+                                          height: 1,
+                                          color: centered
+                                              ? Colors.transparent
+                                              : onSurface.withValues(
+                                                  alpha: 0.25,
+                                                ),
+                                        ),
+                                      ),
+                                      if (showDetails) const SizedBox(width: 8),
+                                      if (showDetails && dragSeek)
+                                        GestureDetector(
+                                          behavior: HitTestBehavior.opaque,
+                                          onTap: () {
+                                            if (index < 0 ||
+                                                index >= m.lines.length) {
+                                              return;
+                                            }
+                                            final start = m.lines[index].start;
+                                            lyrics.controller.stopSelection();
+                                            player.seek(start);
+                                          },
+                                          child: Icon(
+                                            Icons.play_arrow_rounded,
+                                            size: 32,
+                                            color: activeColor,
+                                          ),
+                                        ),
+                                    ],
+                                  );
+                                }(),
+                              ),
+                            ),
+                          ),
+                      ],
+                    );
+                  }(),
                 ),
               ),
+            ),
             // 词/译 切换栏
             Padding(
               padding: const EdgeInsets.fromLTRB(24, 8, 24, 4),
-              child: LyricsActionsBar(
-                hasTranslation: hasTranslation,
-                showTranslation: showTranslation,
-                onOpenSettings: _openLyricsSettingsSheet,
-                onToggleTranslation: () {
-                  _showTranslation.value = !showTranslation;
-                  _setPrefBool(_prefsShowTranslation, _showTranslation.value);
-                },
-                color: onSurface,
+              child: Row(
+                children: [
+                  Expanded(
+                    child: LyricsActionsBar(
+                      hasTranslation: hasTranslation,
+                      showTranslation: showTranslation,
+                      onOpenSettings: _openLyricsSettingsSheet,
+                      onToggleTranslation: () {
+                        _showTranslation.value = !showTranslation;
+                        _setPrefBool(
+                          _prefsShowTranslation,
+                          _showTranslation.value,
+                        );
+                      },
+                      color: onSurface,
+                    ),
+                  ),
+                  if (!widget.showControls) ...[
+                    const SizedBox(width: 8),
+                    PlayerFavoriteButton(
+                      song: player.currentSongSignal.value,
+                      constraints: const BoxConstraints.tightFor(
+                        width: 36,
+                        height: 36,
+                      ),
+                      padding: EdgeInsets.zero,
+                      visualDensity: const VisualDensity(
+                        horizontal: -4,
+                        vertical: -4,
+                      ),
+                    ),
+                  ],
+                ],
               ),
             ),
             // 播放控件 + 底部操作栏（可选，播放页内歌词页开启）
@@ -822,8 +841,15 @@ class _PlayerLyricsViewState extends State<PlayerLyricsView> with SignalsMixin {
     final bottomSpacing = bottomInset > 20 ? bottomInset + 16.0 : 24.0;
     final Widget controls;
     if (stylePreset == PlayerStylePreset.poster) {
-      // 海报模式：与封面页海报布局一致（模式 + 上一首/播放/下一首 + 更多）
-      controls = PosterControls(player: player);
+      // 海报模式：实用操作栏 + 播放控制，与封面页保持一致。
+      controls = Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          PosterBottomActions(player: player),
+          const SizedBox(height: 12),
+          PosterControls(player: player),
+        ],
+      );
     } else {
       // 经典模式：播放控件 + 底部操作栏
       controls = Column(
@@ -835,10 +861,7 @@ class _PlayerLyricsViewState extends State<PlayerLyricsView> with SignalsMixin {
         ],
       );
     }
-    return [
-      controls,
-      SizedBox(height: bottomSpacing),
-    ];
+    return [controls, SizedBox(height: bottomSpacing)];
   }
 }
 

@@ -84,6 +84,13 @@ class AppRoutes {
   static const dlnaSettings = '/settings/dlna';
 }
 
+class BatchMatchRouteArguments {
+  final List<SongEntity> songs;
+  final bool autoStart;
+
+  const BatchMatchRouteArguments({required this.songs, this.autoStart = false});
+}
+
 class AppRouter {
   static String get initialRoute {
     // 如果已有 token 直接进首页，否则去登录页（由 app.dart 中 ValueListenableBuilder 控制）
@@ -120,15 +127,25 @@ class AppRouter {
     AppRoutes.genres: (_) => const GenresPage(),
     AppRoutes.folders: (_) => const FoldersPage(),
     AppRoutes.search: (context) => SearchPage(
-      initialCategory: (ModalRoute.of(context)?.settings.arguments as SearchCategory?) ?? SearchCategory.song,
+      initialCategory:
+          (ModalRoute.of(context)?.settings.arguments as SearchCategory?) ??
+          SearchCategory.song,
     ),
     AppRoutes.profile: (_) => const ProfilePage(),
     AppRoutes.recent: (_) => const RecentPlaybackPage(),
     AppRoutes.favorites: (_) => const FavoritePage(),
-    AppRoutes.batchMatch: (context) => BatchMatchPage(
-      songs: (ModalRoute.of(context)?.settings.arguments as List<dynamic>? ?? const [])
-          .cast<SongEntity>(),
-    ),
+    AppRoutes.batchMatch: (context) {
+      final arguments = ModalRoute.of(context)?.settings.arguments;
+      if (arguments is BatchMatchRouteArguments) {
+        return BatchMatchPage(
+          songs: arguments.songs,
+          autoStart: arguments.autoStart,
+        );
+      }
+      return BatchMatchPage(
+        songs: (arguments as List<dynamic>? ?? const []).cast<SongEntity>(),
+      );
+    },
     AppRoutes.dataSourceSettings: (_) => const SearchSourcePage(),
     AppRoutes.matchSettings: (_) => const MatchSettingsPage(),
     AppRoutes.metadataMatchSettings: (_) => const MetadataMatchSettingsPage(),
@@ -262,8 +279,7 @@ class _PrimaryNavigationShellState extends State<_PrimaryNavigationShell> {
                         index: _currentIndex,
                         children: List.generate(
                           _pages.length,
-                          (index) =>
-                              _pages[index] ?? const SizedBox.shrink(),
+                          (index) => _pages[index] ?? const SizedBox.shrink(),
                         ),
                       ),
                       // 共享底栏：整个 shell 只渲染一份，跨 tab 切换保持常驻，

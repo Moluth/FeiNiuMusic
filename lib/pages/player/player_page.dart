@@ -7,14 +7,12 @@ import 'package:skeletonizer/skeletonizer.dart';
 import 'package:signals_flutter/signals_flutter.dart' hide computed;
 
 import '../../app/router/app_router.dart';
-import '../../app/services/feiniu/favorite_service.dart';
 import '../../app/services/lyrics/lyrics_service.dart';
 import '../../app/services/player_service.dart';
 import '../../app/state/settings_state.dart';
 import '../../app/state/song_state.dart';
 import '../../app/utils/route_visibility.dart';
 import '../../components/common/artwork_widget.dart';
-import '../../components/feedback/app_toast.dart';
 import '../../components/player/lyric_preview.dart';
 import 'lyrics/lyric_view.dart';
 import 'widgets/player_background.dart';
@@ -507,10 +505,7 @@ class _PosterPlayerLayout extends StatelessWidget {
   final PlayerService player;
   final VoidCallback onTapLyrics;
 
-  const _PosterPlayerLayout({
-    required this.player,
-    required this.onTapLyrics,
-  });
+  const _PosterPlayerLayout({required this.player, required this.onTapLyrics});
 
   @override
   Widget build(BuildContext context) {
@@ -543,12 +538,7 @@ class _PosterPlayerLayout extends StatelessWidget {
             Expanded(
               child: Container(
                 width: double.infinity,
-                padding: EdgeInsets.fromLTRB(
-                  24,
-                  headerPad,
-                  24,
-                  bottomPad,
-                ),
+                padding: EdgeInsets.fromLTRB(24, headerPad, 24, bottomPad),
                 // Transparent so the cover-color + 流光 background shows through,
                 // matching the lyrics page (no solid white panel).
                 child: Column(
@@ -599,13 +589,13 @@ class _PosterPlayerLayout extends StatelessWidget {
                       ),
                     ),
                     const SizedBox(height: 12),
-                    // 收藏 / 队列按钮（与 1.4.1 一致，位于进度条上方）。
+                    // 定时 / 收藏 / 队列按钮，位于进度条上方。
                     // 两端与轨道内缩（_posterTrackInset）对齐，不超出轨道。
                     Padding(
                       padding: const EdgeInsets.symmetric(
                         horizontal: _posterTrackInset,
                       ),
-                      child: _PosterMetaRow(player: player, song: song),
+                      child: PosterBottomActions(player: player),
                     ),
                     const SizedBox(height: 2),
                     _PosterSeekBar(player: player),
@@ -615,10 +605,7 @@ class _PosterPlayerLayout extends StatelessWidget {
                       padding: const EdgeInsets.symmetric(
                         horizontal: _posterTrackInset,
                       ),
-                      child: PosterControls(
-                        player: player,
-                        alignToTrack: true,
-                      ),
+                      child: PosterControls(player: player, alignToTrack: true),
                     ),
                     // 底部留白：让控制栏整体抬离屏幕底部
                     SizedBox(height: bottomInset > 20 ? 16 : 28),
@@ -672,10 +659,7 @@ class _PosterArtwork extends StatelessWidget {
                 height: frostHeight,
                 child: ClipRect(
                   child: ImageFiltered(
-                    imageFilter: ui.ImageFilter.blur(
-                      sigmaX: 18,
-                      sigmaY: 18,
-                    ),
+                    imageFilter: ui.ImageFilter.blur(sigmaX: 18, sigmaY: 18),
                     child: _buildCover(context),
                   ),
                 ),
@@ -696,13 +680,7 @@ class _PosterArtwork extends StatelessWidget {
                     Color(0x00FFFFFF),
                     Color(0x00FFFFFF),
                   ],
-                  stops: [
-                    0.0,
-                    frostHeight / heroHeight,
-                    0.62,
-                    0.95,
-                    1.0,
-                  ],
+                  stops: [0.0, frostHeight / heroHeight, 0.62, 0.95, 1.0],
                 ).createShader(rect),
                 child: _buildCover(context),
               ),
@@ -738,7 +716,9 @@ class _PosterArtwork extends StatelessWidget {
         // boxSize 为 0 或 NaN，连锁导致 ShaderMask/RotationTransition
         // 产生 Matrix4 非有限值 / RRect NaN 崩溃。
         final maxW = constraints.maxWidth.isFinite ? constraints.maxWidth : 0.0;
-        final maxH = constraints.maxHeight.isFinite ? constraints.maxHeight : 0.0;
+        final maxH = constraints.maxHeight.isFinite
+            ? constraints.maxHeight
+            : 0.0;
         final boxSize = (maxW > maxH ? maxW : maxH).clamp(1.0, 2000.0);
         final child = song == null
             ? Skeletonizer(
@@ -864,132 +844,6 @@ class _PosterLyricLine extends StatelessWidget {
   }
 }
 
-class _PosterMetaRow extends StatelessWidget {
-  final PlayerService player;
-  final SongEntity? song;
-
-  const _PosterMetaRow({required this.player, required this.song});
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Row(
-      children: [
-        _PosterFavoriteButton(song: song),
-        const Spacer(),
-        IconButton(
-          visualDensity: const VisualDensity(horizontal: -4, vertical: -4),
-          padding: EdgeInsets.zero,
-          constraints: const BoxConstraints.tightFor(width: 34, height: 34),
-          icon: Icon(
-            Icons.menu_rounded,
-            color: scheme.onSurface.withValues(alpha: 0.72),
-            size: 24,
-          ),
-          onPressed: () => showPlayerPlaylistSheet(context, player),
-        ),
-      ],
-    );
-  }
-}
-
-class _PosterFavoriteButton extends StatefulWidget {
-  final SongEntity? song;
-
-  const _PosterFavoriteButton({required this.song});
-
-  @override
-  State<_PosterFavoriteButton> createState() => _PosterFavoriteButtonState();
-}
-
-class _PosterFavoriteButtonState extends State<_PosterFavoriteButton> {
-  final FeiNiuFavoriteService _favoriteService = FeiNiuFavoriteService.instance;
-  bool _isFavorite = false;
-  bool _loading = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _loadFavoriteState();
-  }
-
-  @override
-  void didUpdateWidget(covariant _PosterFavoriteButton oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.song?.id != widget.song?.id) {
-      _loadFavoriteState();
-    }
-  }
-
-  Future<void> _loadFavoriteState() async {
-    final song = widget.song;
-    if (song == null) {
-      if (mounted) {
-        setState(() {
-          _isFavorite = false;
-          _loading = false;
-        });
-      }
-      return;
-    }
-    setState(() => _loading = true);
-    try {
-      final favIds = await _favoriteService.getFavoriteIds();
-      if (!mounted || widget.song?.id != song.id) return;
-      setState(() {
-        _isFavorite = favIds.contains(song.id);
-        _loading = false;
-      });
-    } catch (_) {
-      if (mounted) setState(() => _loading = false);
-    }
-  }
-
-  Future<void> _toggleFavorite() async {
-    final song = widget.song;
-    if (_loading || song == null) return;
-    setState(() => _loading = true);
-    try {
-      if (_isFavorite) {
-        await _favoriteService.unfavorite(song.id);
-        if (!mounted) return;
-        setState(() {
-          _isFavorite = false;
-          _loading = false;
-        });
-        AppToast.show(context, '已取消收藏');
-      } else {
-        await _favoriteService.favorite(song.id);
-        if (!mounted) return;
-        setState(() {
-          _isFavorite = true;
-          _loading = false;
-        });
-        AppToast.show(context, '已收藏');
-      }
-    } catch (_) {
-      if (mounted) setState(() => _loading = false);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return IconButton(
-      visualDensity: const VisualDensity(horizontal: -4, vertical: -4),
-      padding: EdgeInsets.zero,
-      constraints: const BoxConstraints.tightFor(width: 34, height: 34),
-      icon: Icon(
-        _isFavorite ? Icons.favorite_rounded : Icons.favorite_border_rounded,
-        color: _isFavorite
-            ? Colors.deepOrangeAccent
-            : Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.72),
-        size: 24,
-      ),
-      onPressed: widget.song == null || _loading ? null : _toggleFavorite,
-    );
-  }
-}
-
 class _PosterSeekBar extends StatefulWidget {
   final PlayerService player;
 
@@ -1101,7 +955,9 @@ class _PosterSeekBarState extends State<_PosterSeekBar> with SignalsMixin {
             // 时间标签：位于进度条下方，两端与轨道内缩（_posterTrackInset）对齐，
             // 不超出进度条两端的实际长度。
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: _posterTrackInset),
+              padding: const EdgeInsets.symmetric(
+                horizontal: _posterTrackInset,
+              ),
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
@@ -1143,8 +999,7 @@ class _PlayerArtwork extends StatelessWidget {
       valueListenable: AppLayoutSettings.effectiveTabletModeNotifier,
       builder: (context, effectiveTabletMode, _) {
         final isTabletLayout =
-            effectiveTabletMode &&
-            MediaQuery.sizeOf(context).width >= 720;
+            effectiveTabletMode && MediaQuery.sizeOf(context).width >= 720;
         final isTv = AppLayoutSettings.tvMode.value;
         return Watch.builder(
           builder: (context) {
@@ -1166,8 +1021,9 @@ class _PlayerArtwork extends StatelessWidget {
                     // 塌缩成 0，导致封面贴顶、居中失效、底栏消失）。
                     final width = constraints.maxWidth;
                     final boxSize = width < maxSize ? width : maxSize;
-                    final size =
-                        boxSize < constraints.maxHeight ? boxSize : constraints.maxHeight;
+                    final size = boxSize < constraints.maxHeight
+                        ? boxSize
+                        : constraints.maxHeight;
                     return Center(
                       child: SizedBox(
                         width: size,
@@ -1188,10 +1044,12 @@ class _PlayerArtwork extends StatelessWidget {
                 builder: (context, constraints) {
                   final width = constraints.maxWidth;
                   final boxSize = width < maxSize ? width : maxSize;
-                  final size =
-                      boxSize < constraints.maxHeight ? boxSize : constraints.maxHeight;
-                  final borderRadius =
-                      PlayerBackgroundSettings.roundCover.value ? size / 2 : 12.0;
+                  final size = boxSize < constraints.maxHeight
+                      ? boxSize
+                      : constraints.maxHeight;
+                  final borderRadius = PlayerBackgroundSettings.roundCover.value
+                      ? size / 2
+                      : 12.0;
                   return Center(
                     child: SizedBox(
                       width: size,

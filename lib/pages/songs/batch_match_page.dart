@@ -17,8 +17,13 @@ import '../../components/index.dart';
 ///    自动取候选，上传封面、回传 NAS（updateTrackMetadata）。
 class BatchMatchPage extends StatefulWidget {
   final List<SongEntity> songs;
+  final bool autoStart;
 
-  const BatchMatchPage({super.key, required this.songs});
+  const BatchMatchPage({
+    super.key,
+    required this.songs,
+    this.autoStart = false,
+  });
 
   @override
   State<BatchMatchPage> createState() => _BatchMatchPageState();
@@ -45,6 +50,18 @@ class _BatchMatchPageState extends State<BatchMatchPage> {
     for (final song in widget.songs) {
       _status[song.id] = 'pending';
     }
+    if (widget.autoStart) {
+      _fields.addAll(const {
+        MatchField.title,
+        MatchField.artist,
+        MatchField.album,
+        MatchField.year,
+      });
+      _writeMode = MatchWriteMode.overwrite;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _start();
+      });
+    }
   }
 
   Future<void> _start() async {
@@ -65,8 +82,9 @@ class _BatchMatchPageState extends State<BatchMatchPage> {
 
     // 服务端全自动处理：搜索取首个候选并写入歌手/歌词/专辑/封面。
     final wants = _fields.map((f) => f.name).toList();
-    final writeMode =
-        _writeMode == MatchWriteMode.overwrite ? 'overwrite' : 'fill';
+    final writeMode = _writeMode == MatchWriteMode.overwrite
+        ? 'overwrite'
+        : 'fill';
     final preferFilename = MatchSettings.preferFilename.value;
     final lyricOptions = <String, dynamic>{
       'convert': switch (MatchSettings.chineseConvert.value) {
@@ -78,13 +96,15 @@ class _BatchMatchPageState extends State<BatchMatchPage> {
       'filterRules': MatchSettings.filterRules.value,
     };
     final songs = widget.songs
-        .map((s) => {
-              'guid': s.id,
-              'title': s.title,
-              'artist': s.artistDisplayName,
-              'album': s.albumDisplayName,
-              'duration': s.durationMs ?? 0,
-            })
+        .map(
+          (s) => {
+            'guid': s.id,
+            'title': s.title,
+            'artist': s.artistDisplayName,
+            'album': s.albumDisplayName,
+            'duration': s.durationMs ?? 0,
+          },
+        )
         .toList();
 
     try {
@@ -112,6 +132,7 @@ class _BatchMatchPageState extends State<BatchMatchPage> {
           await LyricsRepository().removeCachedLrc(r.guid);
         }
       }
+      if (!mounted) return;
       AppToast.show(context, '批量匹配完成：成功 $_success，失败 $_failed');
     } catch (e) {
       debugPrint('[BatchMatch] 批量匹配失败: $e');
@@ -120,7 +141,6 @@ class _BatchMatchPageState extends State<BatchMatchPage> {
       AppToast.show(context, '批量匹配失败：$e', type: ToastType.error);
     }
   }
-
 
   @override
   Widget build(BuildContext context) {
@@ -186,10 +206,7 @@ class _BatchMatchPageState extends State<BatchMatchPage> {
             Row(
               children: [
                 const SizedBox(width: 12),
-                Text(
-                  '全选',
-                  style: theme.textTheme.bodyMedium,
-                ),
+                Text('全选', style: theme.textTheme.bodyMedium),
                 const Spacer(),
                 Checkbox(
                   value: _fields.length == MatchField.values.length,
@@ -357,22 +374,22 @@ class _BatchMatchPageState extends State<BatchMatchPage> {
                 ),
                 trailing: switch (status) {
                   'running' => const SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    ),
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
                   'done' => Icon(
-                      Icons.check_circle_rounded,
-                      color: theme.colorScheme.primary,
-                    ),
+                    Icons.check_circle_rounded,
+                    color: theme.colorScheme.primary,
+                  ),
                   'error' => Icon(
-                      Icons.error_rounded,
-                      color: theme.colorScheme.error,
-                    ),
+                    Icons.error_rounded,
+                    color: theme.colorScheme.error,
+                  ),
                   _ => Icon(
-                      Icons.schedule_rounded,
-                      color: theme.colorScheme.onSurfaceVariant,
-                    ),
+                    Icons.schedule_rounded,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
                 },
                 // 批量匹配由服务端全自动处理，单首不可单独重匹配
                 onTap: null,
@@ -409,4 +426,3 @@ class _BatchMatchPageState extends State<BatchMatchPage> {
     );
   }
 }
-

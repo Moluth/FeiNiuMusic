@@ -159,11 +159,7 @@ class PlayerStylePreview extends StatelessWidget {
                       // 播放页观感一致（真机约 12px @ ~320px 封面 ≈ 4%）。
                       final coverSize = constraints.maxWidth;
                       final radius = (coverSize * 0.04).clamp(4.0, 12.0);
-                      return _cover(
-                        accent,
-                        circle: roundCover,
-                        radius: radius,
-                      );
+                      return _cover(accent, circle: roundCover, radius: radius);
                     },
                   ),
                 ),
@@ -176,7 +172,13 @@ class PlayerStylePreview extends StatelessWidget {
             child: Column(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                _lyricLine(context, '有一束光 那瞬间', size: 7, centered: true, stretch: true),
+                _lyricLine(
+                  context,
+                  '有一束光 那瞬间',
+                  size: 7,
+                  centered: true,
+                  stretch: true,
+                ),
                 const SizedBox(height: 3),
                 _lyricLine(
                   context,
@@ -187,7 +189,13 @@ class PlayerStylePreview extends StatelessWidget {
                   stretch: true,
                 ),
                 const SizedBox(height: 3),
-                _lyricLine(context, '你的视线 是谅解', size: 7, centered: true, stretch: true),
+                _lyricLine(
+                  context,
+                  '你的视线 是谅解',
+                  size: 7,
+                  centered: true,
+                  stretch: true,
+                ),
               ],
             ),
           ),
@@ -262,7 +270,12 @@ class PlayerStylePreview extends StatelessWidget {
                     children: [
                       _titleText(context, _sampleTitle, size: 11),
                       const SizedBox(height: 2),
-                      _titleText(context, _sampleArtist, size: 7, secondary: true),
+                      _titleText(
+                        context,
+                        _sampleArtist,
+                        size: 7,
+                        secondary: true,
+                      ),
                       const SizedBox(height: 8),
                       _lyricLine(context, '有一束光 那瞬间', size: 7),
                       const SizedBox(height: 5),
@@ -299,7 +312,12 @@ class PlayerStylePreview extends StatelessWidget {
     );
   }
 
-  Widget _cover(Color color, {double? size, double? radius, bool circle = false}) {
+  Widget _cover(
+    Color color, {
+    double? size,
+    double? radius,
+    bool circle = false,
+  }) {
     final clip = circle
         ? ClipOval(
             child: Image.asset(
@@ -523,10 +541,11 @@ class PlayerStylePreview extends StatelessWidget {
       context,
     ).colorScheme.onSurfaceVariant.withValues(alpha: 0.6);
     return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
       children: [
         Icon(Icons.repeat_rounded, size: 11, color: color),
         Icon(Icons.alarm_rounded, size: 11, color: color),
+        Icon(Icons.favorite_border_rounded, size: 11, color: color),
         Icon(Icons.format_list_bulleted_rounded, size: 11, color: color),
         Icon(Icons.more_horiz_rounded, size: 11, color: color),
       ],

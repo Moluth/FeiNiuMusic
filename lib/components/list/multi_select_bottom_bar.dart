@@ -3,10 +3,7 @@ import 'package:flutter/material.dart';
 class MultiSelectBottomBar extends StatelessWidget {
   final List<MultiSelectAction> actions;
 
-  const MultiSelectBottomBar({
-    super.key,
-    required this.actions,
-  });
+  const MultiSelectBottomBar({super.key, required this.actions});
 
   @override
   Widget build(BuildContext context) {
@@ -25,8 +22,7 @@ class MultiSelectBottomBar extends StatelessWidget {
         ),
         padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
         child: Row(
-          mainAxisAlignment: MainAxisAlignment.spaceAround,
-          children: actions,
+          children: [for (final action in actions) Expanded(child: action)],
         ),
       ),
     );
@@ -58,18 +54,26 @@ class MultiSelectAction extends StatelessWidget {
       onTap: onTap,
       borderRadius: BorderRadius.circular(8),
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(icon, color: color, size: 24),
             const SizedBox(height: 4),
-            Text(
-              label,
-              style: TextStyle(
-                color: color,
-                fontSize: 11,
-                fontWeight: FontWeight.w500,
+            SizedBox(
+              height: 28,
+              child: Center(
+                child: Text(
+                  label,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: color,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
               ),
             ),
           ],

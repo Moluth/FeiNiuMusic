@@ -12,9 +12,9 @@ void main() {
     SharedPreferences.setMockInitialValues({});
     AppLayoutSettings.resetForTest();
   });
-  tearDown(() {
+  tearDown(() async {
     AppLayoutSettings.resetForTest();
-    LoginPairServer.stop();
+    await LoginPairServer.stop();
   });
 
   testWidgets('非 TV：无二维码卡片（原样渲染）', (tester) async {
@@ -26,7 +26,17 @@ void main() {
 
   testWidgets('TV 模式：显示二维码卡片', (tester) async {
     AppLayoutSettings.tvMode.value = true;
-    await tester.pumpWidget(const MaterialApp(home: LoginPage()));
+    await tester.pumpWidget(
+      MaterialApp(
+        home: LoginPage(
+          startPairServer: () async => const LoginPairSession([
+            'http://192.168.1.5:12345/f/'
+                '0123456789abcdef0123456789abcdef',
+          ]),
+          waitPairLogin: () async => null,
+        ),
+      ),
+    );
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
     expect(find.byType(LoginQrCard), findsOneWidget);

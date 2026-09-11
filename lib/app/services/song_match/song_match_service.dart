@@ -1,8 +1,12 @@
+import 'dart:convert';
+
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 
 import '../../state/settings_match.dart';
+import '../../state/song_state.dart';
+import '../../utils/map_concurrent.dart';
 import '../companion/metadata_companion_service.dart';
 import '../feiniu/api_client.dart';
 import '../feiniu/api_models.dart';
@@ -24,26 +28,22 @@ enum MatchField {
 
 extension MatchFieldLabel on MatchField {
   String get label => switch (this) {
-        MatchField.title => '标题',
-        MatchField.artist => '歌手',
-        MatchField.album => '专辑',
-        MatchField.year => '年份',
-        MatchField.trackNumber => '歌曲序号',
-        MatchField.discNumber => '光盘序号',
-        MatchField.cover => '封面',
-        MatchField.lyrics => '歌词',
-      };
+    MatchField.title => '标题',
+    MatchField.artist => '歌手',
+    MatchField.album => '专辑',
+    MatchField.year => '年份',
+    MatchField.trackNumber => '歌曲序号',
+    MatchField.discNumber => '光盘序号',
+    MatchField.cover => '封面',
+    MatchField.lyrics => '歌词',
+  };
 }
 
 /// 匹配写入模式：覆盖（用匹配结果覆盖现有值）或填充（仅当现有值为空时写入）。
-enum MatchWriteMode {
-  overwrite,
-  fill,
-}
+enum MatchWriteMode { overwrite, fill }
 
 extension MatchWriteModeLabel on MatchWriteMode {
-  String get label =>
-      this == MatchWriteMode.overwrite ? '覆盖' : '填充（仅空值）';
+  String get label => this == MatchWriteMode.overwrite ? '覆盖' : '填充（仅空值）';
 
   String get description => this == MatchWriteMode.overwrite
       ? '用匹配到的结果覆盖当前歌曲的对应字段'
@@ -57,13 +57,19 @@ class MatchOptions {
   final bool autoConfirmCandidates; // true=取第一个候选；false=逐首弹候选确认
 
   const MatchOptions({
-    this.fields = const {
-      MatchField.title,
-      MatchField.artist,
-      MatchField.album,
-    },
+    this.fields = const {MatchField.title, MatchField.artist, MatchField.album},
     this.writeMode = MatchWriteMode.fill,
     this.autoConfirmCandidates = true,
+  });
+}
+
+class FilenameMetadataResetResult {
+  final List<SongEntity> updatedSongs;
+  final int failedCount;
+
+  const FilenameMetadataResetResult({
+    required this.updatedSongs,
+    required this.failedCount,
   });
 }
 
@@ -103,6 +109,59 @@ class SongMatchService {
 
   final BackendMatchClient _backend = BackendMatchClient.instance;
   final FeiNiuApiClient _api = FeiNiuApiClient.instance;
+
+  /// 将曲目标题替换为无扩展名文件名，并清空歌手、专辑和年份后写回 NAS。
+  ///
+  /// 保留封面、流派、曲序和碟号；单首失败不会中断其余曲目。
+  Future<FilenameMetadataResetResult> resetMetadataToFilenames(
+    List<SongEntity> songs, {
+    int concurrency = 3,
+  }) async {
+    final attempts = await mapConcurrent(songs, concurrency, (song) async {
+      try {
+        final track = await _api.getTrackMetadata(song.id);
+        if (track == null) {
+          throw StateError('无法读取曲目元数据');
+        }
+        final body = filenameMetadataResetBody(track);
+        await _api.updateTrackMetadata(body);
+        return song.copyWith(
+          title: body['title'] as String,
+          artist: '[]',
+          album: jsonEncode(const <String, String>{'name': ''}),
+        );
+      } catch (e) {
+        debugPrint('[SongMatch] 文件名替换歌名失败 ${song.id}: $e');
+        return null;
+      }
+    });
+    final updatedSongs = attempts.whereType<SongEntity>().toList();
+    return FilenameMetadataResetResult(
+      updatedSongs: updatedSongs,
+      failedCount: songs.length - updatedSongs.length,
+    );
+  }
+
+  static Map<String, dynamic> filenameMetadataResetBody(FeiNiuTrack track) {
+    final title = filenameFromPath(track.audioSpec?.path);
+    if (title.isEmpty) {
+      throw StateError('曲目文件名为空');
+    }
+    final coverId = track.coverId;
+    return <String, dynamic>{
+      'guid': track.guid,
+      'title': title,
+      'album': '',
+      'artistGUIDs': const <String>[],
+      'genreGUIDs': track.genres.map((genre) => genre.guid).toList(),
+      'year': null,
+      'trackNo': track.trackNo,
+      'discNo': track.discNo,
+      if (coverId != null && coverId.isNotEmpty) 'coverId': coverId,
+      if (coverId != null && coverId.isNotEmpty)
+        'coverGUID': FeiNiuApiClient.deriveCoverGuid(coverId),
+    };
+  }
 
   /// 当前是否可用（已配置服务端增强地址 + 已登录）。
   bool get available => _backend.available;
@@ -166,10 +225,7 @@ class SongMatchService {
       name = name.trim();
       if (name.isNotEmpty) return name;
     }
-    return [
-      title,
-      artist,
-    ].where((s) => s.isNotEmpty).join(' ').trim();
+    return [title, artist].where((s) => s.isNotEmpty).join(' ').trim();
   }
 
   /// 从文件路径提取文件名（去扩展名）；无效返回空。
@@ -332,8 +388,10 @@ class SongMatchService {
     // 库中不存在 → 服务端增强创建（已配置地址 + 已登录时尝试；失败回退 null）
     if (!MetadataCompanionService.instance.available) return null;
     try {
-      final guid = await MetadataCompanionService.instance
-          .createEntity(kind: EntityEditKind.album, name: name);
+      final guid = await MetadataCompanionService.instance.createEntity(
+        kind: EntityEditKind.album,
+        name: name,
+      );
       return FeiNiuAlbum(guid: guid, name: name);
     } catch (e) {
       debugPrint('创建专辑 "$name" 失败: $e');
@@ -418,8 +476,8 @@ List<LyricLine> linesFromPlainLrc(String lrc) {
       final scale = fracRaw.length == 1
           ? 100
           : fracRaw.length == 2
-              ? 10
-              : 1;
+          ? 10
+          : 1;
       startMs += frac * scale;
     }
     final text = m.group(4)!.trim();

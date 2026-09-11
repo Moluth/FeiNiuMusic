@@ -29,7 +29,17 @@ class LoginPage extends StatefulWidget {
   /// （保留原 id 与备注），而非新增/去重。
   final AccountEntry? editAccount;
 
-  const LoginPage({super.key, this.isAddMode = false, this.editAccount});
+  /// 测试注入：避免 widget test 的 fake-async zone 启动真实 socket。
+  final Future<LoginPairSession> Function()? startPairServer;
+  final Future<LoginCredentials?> Function()? waitPairLogin;
+
+  const LoginPage({
+    super.key,
+    this.isAddMode = false,
+    this.editAccount,
+    this.startPairServer,
+    this.waitPairLogin,
+  });
 
   @override
   State<LoginPage> createState() => _LoginPageState();
@@ -46,14 +56,18 @@ class _LoginPageState extends State<LoginPage> {
 
   /// TV 模式输入框焦点节点：空输入框时方向键用于移出输入框。
   /// 非 TV 模式不拦截任何按键，行为与普通 TextField 完全一致。
-  final TvTextFieldFocusNode _serverUrlFocus =
-      TvTextFieldFocusNode(debugLabel: 'serverUrl');
-  final TvTextFieldFocusNode _usernameFocus =
-      TvTextFieldFocusNode(debugLabel: 'username');
-  final TvTextFieldFocusNode _passwordFocus =
-      TvTextFieldFocusNode(debugLabel: 'password');
-  final TvTextFieldFocusNode _nameFocus =
-      TvTextFieldFocusNode(debugLabel: 'name');
+  final TvTextFieldFocusNode _serverUrlFocus = TvTextFieldFocusNode(
+    debugLabel: 'serverUrl',
+  );
+  final TvTextFieldFocusNode _usernameFocus = TvTextFieldFocusNode(
+    debugLabel: 'username',
+  );
+  final TvTextFieldFocusNode _passwordFocus = TvTextFieldFocusNode(
+    debugLabel: 'password',
+  );
+  final TvTextFieldFocusNode _nameFocus = TvTextFieldFocusNode(
+    debugLabel: 'name',
+  );
 
   /// 已保存账号下拉当前选中值（填充表单后复位，避免误以为仍是选中状态）
   String? _selectedAccountId;
@@ -200,7 +214,10 @@ class _LoginPageState extends State<LoginPage> {
   /// App 留在 HTTP 后封面/音频因重定向丢 Cookie 全部加载失败。
   ///
   /// [isRelay] 透传给探测（中继地址按中继链路探测）。
-  Future<String> _resolveServerAddress(String input, {bool isRelay = false}) async {
+  Future<String> _resolveServerAddress(
+    String input, {
+    bool isRelay = false,
+  }) async {
     final trimmed = input.trim();
     final uri = Uri.tryParse(trimmed);
     // 非普通地址（FNID 等）或无法解析 → 原样返回
@@ -277,11 +294,11 @@ class _LoginPageState extends State<LoginPage> {
       // 复用自动静默探测的「新鲜」结果（同一 FNID 且 30 秒内），
       // 避免点登录后又探测一遍。
       final silent = _silentProbeResult;
-      final useSilent = silent != null &&
+      final useSilent =
+          silent != null &&
           _silentProbeFnId == fnId &&
-          DateTime.now().difference(_silentProbeAt) <= const Duration(
-            seconds: 30,
-          );
+          DateTime.now().difference(_silentProbeAt) <=
+              const Duration(seconds: 30);
 
       // 复用静默结果时无需再展示探测浮层（探测已完成，仅走认证）
       if (!useSilent) {
@@ -410,10 +427,7 @@ class _LoginPageState extends State<LoginPage> {
     // 用 root 导航器回退到登录门控（_AppStartupGate）：门控监听 isLoggedIn /
     // currentAccountId，会自动切换到主外壳。不要用 pushReplacementNamed(home)
     // 替换门控 —— 那会让切换账号时的外壳重建失效。
-    Navigator.of(
-      context,
-      rootNavigator: true,
-    ).popUntil((r) => r.isFirst);
+    Navigator.of(context, rootNavigator: true).popUntil((r) => r.isFirst);
   }
 
   /// 若本地尚未存过安全码，探测服务器是否需要并（需要时）弹窗询问。
@@ -467,11 +481,19 @@ class _LoginPageState extends State<LoginPage> {
     }
     if (!mounted) return;
     if (_isFnId(creds.serverInput)) {
-      await _fnLogin(creds.serverInput, creds.username, creds.password,
-          name: creds.name);
+      await _fnLogin(
+        creds.serverInput,
+        creds.username,
+        creds.password,
+        name: creds.name,
+      );
     } else {
-      await _performLogin(creds.serverInput, creds.username, creds.password,
-          name: creds.name);
+      await _performLogin(
+        creds.serverInput,
+        creds.username,
+        creds.password,
+        name: creds.name,
+      );
     }
   }
 
@@ -536,10 +558,7 @@ class _LoginPageState extends State<LoginPage> {
                   onTap: () async {
                     final box = btnContext.findRenderObject() as RenderBox?;
                     if (box == null) return;
-                    final overlay = Overlay.of(
-                      btnContext,
-                      rootOverlay: true,
-                    );
+                    final overlay = Overlay.of(btnContext, rootOverlay: true);
                     final overlayBox =
                         overlay.context.findRenderObject() as RenderBox?;
                     if (overlayBox == null) return;
@@ -551,9 +570,7 @@ class _LoginPageState extends State<LoginPage> {
                     final position = RelativeRect.fromLTRB(
                       topLeft.dx,
                       topLeft.dy + box.size.height,
-                      overlayBox.size.width -
-                          topLeft.dx -
-                          box.size.width,
+                      overlayBox.size.width - topLeft.dx - box.size.width,
                       overlayBox.size.height - topLeft.dy,
                     );
                     final picked = await showMenu<String>(
@@ -609,10 +626,7 @@ class _LoginPageState extends State<LoginPage> {
   }
 
   void _openAccountManagement(BuildContext context) {
-    Navigator.of(
-      context,
-      rootNavigator: true,
-    ).pushNamed(AppRoutes.accounts);
+    Navigator.of(context, rootNavigator: true).pushNamed(AppRoutes.accounts);
   }
 
   @override
@@ -845,7 +859,11 @@ class _LoginPageState extends State<LoginPage> {
           mainAxisAlignment: MainAxisAlignment.center,
           crossAxisAlignment: CrossAxisAlignment.center,
           children: [
-            LoginQrCard(onCredentials: _handleQrCredentials),
+            LoginQrCard(
+              onCredentials: _handleQrCredentials,
+              startServer: widget.startPairServer,
+              waitLogin: widget.waitPairLogin,
+            ),
             const SizedBox(width: 40),
             Flexible(child: page),
           ],

@@ -207,6 +207,9 @@ class _FeiNiuAudioHandler extends BaseAudioHandler
     MediaNotificationSettings.carBluetoothLyrics.addListener(
       _onNotificationSettingsChanged,
     );
+    FeiNiuFavoriteService.instance.favoriteStates.addListener(
+      _onFavoriteStatesChanged,
+    );
     _currentLyricLine = LyricsService.instance.currentLineText.value;
     _loadPlatformCapabilities();
     _syncFromPlayer();
@@ -972,6 +975,17 @@ class _FeiNiuAudioHandler extends BaseAudioHandler
     if (songId != _lastSongId) {
       _lastSongId = songId;
       _currentLyricLine = null;
+      final song = snap.song;
+      if (song == null) {
+        _isFavorite = false;
+      } else {
+        final favorites = FeiNiuFavoriteService.instance;
+        favorites.seedFavoriteState(song.id, song.isFavorite);
+        _isFavorite = favorites.favoriteState(
+          song.id,
+          fallback: song.isFavorite,
+        );
+      }
       _debugLog('song changed to ${snap.song?.title ?? 'none'}');
     }
 
@@ -1214,17 +1228,25 @@ class _FeiNiuAudioHandler extends BaseAudioHandler
   void _refreshFavoriteState() {
     final song = player.snapshot.value.song;
     if (song == null) return;
-    // 从服务器查询收藏状态
-    FeiNiuFavoriteService.instance.isFavorite(song.id).then((fav) {
-      _updateFavorite(fav);
-    });
+    unawaited(FeiNiuFavoriteService.instance.refreshFavoriteState(song.id));
+  }
+
+  void _onFavoriteStatesChanged() {
+    final song = player.snapshot.value.song;
+    if (song == null) return;
+    _updateFavorite(
+      FeiNiuFavoriteService.instance.favoriteState(
+        song.id,
+        fallback: song.isFavorite,
+      ),
+    );
   }
 
   void _updateFavorite(bool value) {
     if (_isFavorite == value) return;
     _isFavorite = value;
     _debugLog('favorite state changed: $_isFavorite');
-    playbackState.add(_stateFromSnap(player.snapshot.value));
+    _syncPlaybackState(player.snapshot.value);
   }
 
   // ---- 通知按钮回调 ----
@@ -1266,22 +1288,15 @@ class _FeiNiuAudioHandler extends BaseAudioHandler
     if (name == _actionFavorite) {
       final song = player.snapshot.value.song;
       if (song == null) return;
-      if (_isFavorite) {
-        _debugLog('favorite remove action song=${song.title}');
-        try {
-          await FeiNiuFavoriteService.instance.unfavorite(song.id);
-          _updateFavorite(false);
-        } catch (e) {
-          _debugLog('unfavorite failed: $e');
-        }
-      } else {
-        _debugLog('favorite add action song=${song.title}');
-        try {
-          await FeiNiuFavoriteService.instance.favorite(song.id);
-          _updateFavorite(true);
-        } catch (e) {
-          _debugLog('favorite failed: $e');
-        }
+      final next = !_isFavorite;
+      _debugLog(
+        '${next ? 'favorite add' : 'favorite remove'} action '
+        'song=${song.title}',
+      );
+      try {
+        await FeiNiuFavoriteService.instance.setFavorite(song.id, next);
+      } catch (e) {
+        _debugLog('${next ? 'favorite' : 'unfavorite'} failed: $e');
       }
       return;
     }

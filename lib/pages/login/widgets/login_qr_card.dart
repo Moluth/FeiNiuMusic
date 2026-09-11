@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
@@ -81,15 +83,16 @@ class _LoginQrCardState extends State<LoginQrCard> {
     }
   }
 
-  void _refresh() {
+  Future<void> _refresh() async {
     _consumed = false;
-    LoginPairServer.stop();
-    _start();
+    await LoginPairServer.stop();
+    if (!mounted) return;
+    await _start();
   }
 
   @override
   void dispose() {
-    LoginPairServer.stop();
+    unawaited(LoginPairServer.stop());
     super.dispose();
   }
 
@@ -158,7 +161,11 @@ class _LoginQrCardState extends State<LoginQrCard> {
 }
 
 class _QrView extends StatelessWidget {
-  const _QrView({required this.url, required this.qrSize, required this.scheme});
+  const _QrView({
+    required this.url,
+    required this.qrSize,
+    required this.scheme,
+  });
   final String url;
   final double qrSize;
   final ColorScheme scheme;

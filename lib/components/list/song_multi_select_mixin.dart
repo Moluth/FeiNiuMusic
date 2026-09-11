@@ -4,11 +4,13 @@ import 'package:signals_flutter/signals_flutter.dart' hide computed;
 import '../../app/services/feiniu/favorite_service.dart';
 import '../../app/services/player_service.dart';
 import '../../app/services/song_match/song_match_service.dart';
+import '../../app/state/settings_match.dart';
 import '../../app/state/song_state.dart';
 import '../../pages/library/playlists_page.dart' show showAddToPlaylistDialog;
 import '../../app/router/app_router.dart';
 import '../feedback/app_toast.dart';
 import 'multi_select_bottom_bar.dart';
+
 /// 全局多选活动计数：当前有多少个页面处于多选状态。
 ///
 /// 平板/TV/Windows 布局的迷你播放器由 [TabletLayoutHost] 统一渲染，不感知
@@ -51,9 +53,12 @@ mixin SongMultiSelectMixin<T extends StatefulWidget>
   }
 
   /// 页面提供：移除收藏成功后收到被移除的 id 列表（收藏页据此清理本地列表）。
-  void Function(List<String> removedIds)? get onSongsRemovedFromFavorite => null;
+  void Function(List<String> removedIds)? get onSongsRemovedFromFavorite =>
+      null;
+  Future<void> Function()? get onSongsMetadataChanged => null;
   late final _multiSelect = createSignal(false);
   late final _selectedIds = createSignal<Set<String>>({});
+  late final _filenameMatchRunning = createSignal(false);
 
   bool get isMultiSelecting => _multiSelect.value;
   int get selectedCount => _selectedIds.value.length;
@@ -90,8 +95,8 @@ mixin SongMultiSelectMixin<T extends StatefulWidget>
     // "setState when widget tree was locked"。
     if (_multiSelect.value) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        globalMultiSelectActive.value =
-            (globalMultiSelectActive.value - 1).clamp(0, 1 << 30);
+        globalMultiSelectActive.value = (globalMultiSelectActive.value - 1)
+            .clamp(0, 1 << 30);
       });
     }
     super.dispose();
@@ -120,7 +125,11 @@ mixin SongMultiSelectMixin<T extends StatefulWidget>
   }
 
   /// tile 左侧：多选中显示勾选圈（保留原封面在右侧）。
-  Widget selectionLeading(BuildContext context, Widget? original, bool selected) {
+  Widget selectionLeading(
+    BuildContext context,
+    Widget? original,
+    bool selected,
+  ) {
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -160,15 +169,12 @@ mixin SongMultiSelectMixin<T extends StatefulWidget>
   Future<void> addSelectedToFavorite() async {
     final ids = _selectedIds.value.toList();
     if (ids.isEmpty) return;
-    final failed =
-        await FeiNiuFavoriteService.instance.favoriteAll(ids);
+    final failed = await FeiNiuFavoriteService.instance.favoriteAll(ids);
     if (!mounted) return;
     final ok = ids.length - failed;
     AppToast.show(
       context,
-      failed == 0
-          ? '已收藏 $ok 首歌曲'
-          : '已收藏 $ok 首，$failed 首失败',
+      failed == 0 ? '已收藏 $ok 首歌曲' : '已收藏 $ok 首，$failed 首失败',
       type: failed == 0 ? ToastType.success : ToastType.error,
     );
     await onMultiSelectDone?.call();
@@ -178,16 +184,13 @@ mixin SongMultiSelectMixin<T extends StatefulWidget>
   Future<void> removeSelectedFromFavorite() async {
     final ids = _selectedIds.value.toList();
     if (ids.isEmpty) return;
-    final failed =
-        await FeiNiuFavoriteService.instance.unfavoriteAll(ids);
+    final failed = await FeiNiuFavoriteService.instance.unfavoriteAll(ids);
     if (!mounted) return;
     final removed = ids.length - failed;
     onSongsRemovedFromFavorite?.call(ids);
     AppToast.show(
       context,
-      failed == 0
-          ? '已移除收藏 $removed 首歌曲'
-          : '已移除收藏 $removed 首，$failed 首失败',
+      failed == 0 ? '已移除收藏 $removed 首歌曲' : '已移除收藏 $removed 首，$failed 首失败',
       type: failed == 0 ? ToastType.success : ToastType.error,
     );
     await onMultiSelectDone?.call();
@@ -230,13 +233,86 @@ mixin SongMultiSelectMixin<T extends StatefulWidget>
     nav.pushNamed(AppRoutes.batchMatch, arguments: songs);
   }
 
+  Future<void> replaceTitlesWithFilenamesAndMatch() async {
+    final songs = List<SongEntity>.of(selectedSongs);
+    if (songs.isEmpty || _filenameMatchRunning.value || !mounted) return;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        icon: const Icon(Icons.warning_amber_rounded),
+        title: const Text('文件名替换歌名'),
+        content: Text(
+          '将处理所选 ${songs.length} 首歌曲：\n\n'
+          '1. 使用无后缀文件名替换歌名\n'
+          '2. 清空歌手、专辑和年份并立即写入 NAS\n'
+          '3. 自动批量匹配标题、歌手、专辑和年份，再次写入 NAS\n\n'
+          '此操作会修改曲库元数据，建议先用少量歌曲验证。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('开始处理'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    _filenameMatchRunning.value = true;
+    try {
+      await MatchSettings.ensureLoaded();
+      final result = await SongMatchService.instance.resetMetadataToFilenames(
+        songs,
+        concurrency: MatchSettings.concurrency.value,
+      );
+      if (!mounted) return;
+      if (result.updatedSongs.isEmpty) {
+        AppToast.show(context, '未能读取文件名，操作已停止', type: ToastType.error);
+        return;
+      }
+      if (result.failedCount > 0) {
+        AppToast.show(
+          context,
+          '${result.failedCount} 首处理失败，将继续匹配其余歌曲',
+          type: ToastType.error,
+        );
+      }
+
+      await Navigator.of(context).pushNamed(
+        AppRoutes.batchMatch,
+        arguments: BatchMatchRouteArguments(
+          songs: result.updatedSongs,
+          autoStart: true,
+        ),
+      );
+      if (!mounted) return;
+      await onSongsMetadataChanged?.call();
+      await onMultiSelectDone?.call();
+    } catch (e) {
+      if (mounted) {
+        AppToast.show(context, '文件名替换歌名失败：$e', type: ToastType.error);
+      }
+    } finally {
+      if (mounted) {
+        _filenameMatchRunning.value = false;
+      }
+    }
+  }
+
   /// 构建多选底部操作栏。
   ///
   /// [includeFavorite] 为 false 时隐藏「添加到收藏」（收藏页已收藏）；
   /// [includeRemoveFavorite] 为 true 时增加「移除收藏」（仅收藏页）。
+  /// [includeFilenameMatch] 仅歌曲列表页开启。
   Widget buildMultiSelectBar({
     bool includeFavorite = true,
     bool includeRemoveFavorite = false,
+    bool includeFilenameMatch = false,
   }) {
     final empty = _selectedIds.value.isEmpty;
     final actions = <MultiSelectAction>[
@@ -256,6 +332,14 @@ mixin SongMultiSelectMixin<T extends StatefulWidget>
           icon: Icons.travel_explore_rounded,
           label: '批量匹配',
           onTap: empty ? null : () => matchSelectedSongs(),
+        ),
+      if (includeFilenameMatch && SongMatchService.instance.available)
+        MultiSelectAction(
+          icon: Icons.drive_file_rename_outline_rounded,
+          label: '文件名替换歌名',
+          onTap: empty || _filenameMatchRunning.value
+              ? null
+              : () => replaceTitlesWithFilenamesAndMatch(),
         ),
       if (includeFavorite)
         MultiSelectAction(
