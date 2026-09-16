@@ -112,6 +112,54 @@ class CoverLocalCache {
     return await _downloadDirect(url, target);
   }
 
+  /// 将已经下载好的匹配封面写入 App 与原生媒体层共用的本地缓存。
+  ///
+  /// 保存歌曲元数据前调用，使新 coverId 生效时各处 UI 可直接命中本地文件，
+  /// 无需再次从服务端下载同一张封面。
+  static Future<void> seedMatchedCover(
+    String coverId,
+    String sourcePath, {
+    int? updatedAt,
+  }) async {
+    if (coverId.isEmpty || sourcePath.isEmpty) return;
+    final source = io.File(sourcePath);
+    if (!await source.exists()) return;
+    final bytes = await source.readAsBytes();
+    if (bytes.isEmpty) return;
+
+    const sizes = <int>[40, 120, 512, FeiNiuApiClient.coverRequestSize];
+    var seeded = false;
+    for (final size in sizes) {
+      final url = FeiNiuApiClient.instance.coverUrl(
+        coverId,
+        size: size,
+        updatedAt: updatedAt,
+      );
+      try {
+        await _coverCache.putFile(
+          url,
+          bytes,
+          key: url,
+          maxAge: refreshInterval,
+          fileExtension: 'jpg',
+        );
+        final target = await _cacheFileFor(
+          coverId,
+          updatedAt: updatedAt,
+          size: size,
+        );
+        if (!await target.exists()) {
+          await target.writeAsBytes(bytes, flush: true);
+        }
+        lastRefreshedPath = target.path;
+        seeded = true;
+      } catch (error) {
+        _debugLog('seed matched cover size=$size failed: $error');
+      }
+    }
+    if (seeded) refreshVersion.value++;
+  }
+
   static bool isCacheFresh({
     required DateTime modifiedAt,
     required DateTime now,

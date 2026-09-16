@@ -109,6 +109,18 @@ class SongMatchService {
 
   final BackendMatchClient _backend = BackendMatchClient.instance;
   final FeiNiuApiClient _api = FeiNiuApiClient.instance;
+  final Map<String, ({DateTime createdAt, GroupedSongResults results})>
+  _searchCache = {};
+  final Map<String, Future<GroupedSongResults>> _searchInflight = {};
+  static const _searchCacheTtl = Duration(minutes: 2);
+  static const _entityCacheTtl = Duration(minutes: 5);
+  String? _entityCacheScope;
+  DateTime? _artistCacheCreatedAt;
+  DateTime? _albumCacheCreatedAt;
+  List<FeiNiuArtist>? _artistCache;
+  List<FeiNiuAlbum>? _albumCache;
+  Future<List<FeiNiuArtist>>? _artistInflight;
+  Future<List<FeiNiuAlbum>>? _albumInflight;
 
   /// 将曲目标题替换为无扩展名文件名，并清空歌手、专辑和年份后写回 NAS。
   ///
@@ -172,12 +184,45 @@ class SongMatchService {
     int page = 1,
     int pageSize = 20,
   }) {
-    return _backend.searchSongs(
+    final sources = MatchSourceState.instance.enabledIdsInOrder;
+    final key = [
+      _api.baseUrl,
+      _api.token.hashCode,
+      keyword.trim(),
+      sources.join(','),
+      page,
+      pageSize,
+    ].join('|');
+    final now = DateTime.now();
+    final cached = _searchCache[key];
+    if (cached != null && now.difference(cached.createdAt) < _searchCacheTtl) {
+      return Future<GroupedSongResults>.value(cached.results);
+    }
+    final existing = _searchInflight[key];
+    if (existing != null) return existing;
+    final future = _backend.searchSongs(
       keyword: keyword,
-      sources: MatchSourceState.instance.enabledIdsInOrder,
+      sources: sources,
       page: page,
       pageSize: pageSize,
     );
+    _searchInflight[key] = future;
+    future
+        .then((results) {
+          _searchCache[key] = (createdAt: DateTime.now(), results: results);
+          if (_searchCache.length > 24) {
+            final oldest = _searchCache.entries.reduce(
+              (a, b) => a.value.createdAt.isBefore(b.value.createdAt) ? a : b,
+            );
+            _searchCache.remove(oldest.key);
+          }
+        }, onError: (_) {})
+        .whenComplete(() {
+          if (identical(_searchInflight[key], future)) {
+            _searchInflight.remove(key);
+          }
+        });
+    return future;
   }
 
   /// 搜索封面候选（后端多平台搜索）。
@@ -334,8 +379,7 @@ class SongMatchService {
     String separator = '/',
   }) async {
     if (artistNames.trim().isEmpty) return [];
-    final artists = await _api.getArtistListAll();
-    if (artists.isEmpty) return [];
+    final artists = await _getArtistsCached();
 
     final names = artistNames
         .split(RegExp(RegExp.escape(separator)))
@@ -360,6 +404,7 @@ class SongMatchService {
         try {
           final created = await _api.createArtist(name);
           byName[created.name] = created;
+          _artistCache = [...?_artistCache, created];
           if (!resolved.contains(created)) resolved.add(created);
         } catch (e) {
           debugPrint('创建歌手 "$name" 失败: $e');
@@ -380,7 +425,7 @@ class SongMatchService {
     if (name.isEmpty) return null;
 
     // 先在库中精确匹配
-    final albums = await _api.getAlbumListAll();
+    final albums = await _getAlbumsCached();
     for (final album in albums) {
       if (album.name == name) return album;
     }
@@ -392,11 +437,73 @@ class SongMatchService {
         kind: EntityEditKind.album,
         name: name,
       );
-      return FeiNiuAlbum(guid: guid, name: name);
+      final created = FeiNiuAlbum(guid: guid, name: name);
+      _albumCache = [...?_albumCache, created];
+      return created;
     } catch (e) {
       debugPrint('创建专辑 "$name" 失败: $e');
       return null;
     }
+  }
+
+  void _ensureEntityCacheScope() {
+    final scope = '${_api.baseUrl}|${_api.token.hashCode}';
+    if (_entityCacheScope == scope) return;
+    _entityCacheScope = scope;
+    _artistCacheCreatedAt = null;
+    _albumCacheCreatedAt = null;
+    _artistCache = null;
+    _albumCache = null;
+    _artistInflight = null;
+    _albumInflight = null;
+  }
+
+  Future<List<FeiNiuArtist>> _getArtistsCached() {
+    _ensureEntityCacheScope();
+    final now = DateTime.now();
+    final cached = _artistCache;
+    if (cached != null &&
+        _artistCacheCreatedAt != null &&
+        now.difference(_artistCacheCreatedAt!) < _entityCacheTtl) {
+      return Future<List<FeiNiuArtist>>.value(cached);
+    }
+    final existing = _artistInflight;
+    if (existing != null) return existing;
+    final future = _api.getArtistListAll();
+    _artistInflight = future;
+    future
+        .then((artists) {
+          _artistCache = artists;
+          _artistCacheCreatedAt = DateTime.now();
+        }, onError: (_) {})
+        .whenComplete(() {
+          if (identical(_artistInflight, future)) _artistInflight = null;
+        });
+    return future;
+  }
+
+  Future<List<FeiNiuAlbum>> _getAlbumsCached() {
+    _ensureEntityCacheScope();
+    final now = DateTime.now();
+    final cached = _albumCache;
+    if (cached != null &&
+        _albumCacheCreatedAt != null &&
+        now.difference(_albumCacheCreatedAt!) < _entityCacheTtl) {
+      return Future<List<FeiNiuAlbum>>.value(cached);
+    }
+    final existing = _albumInflight;
+    if (existing != null) return existing;
+    final future = _api.getAlbumListAll();
+    _albumInflight = future;
+    future
+        .then((albums) {
+          _albumCache = albums;
+          _albumCacheCreatedAt = DateTime.now();
+        }, onError: (_) {})
+        .whenComplete(() {
+          if (identical(_albumInflight, future)) _albumInflight = null;
+        });
+    return future;
   }
 
   /// 下载候选封面为 base64（供 [FeiNiuApiClient.uploadTrackCover] 上传 NAS）。

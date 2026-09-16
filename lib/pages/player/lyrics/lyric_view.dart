@@ -622,9 +622,8 @@ class _PlayerLyricsViewState extends State<PlayerLyricsView> with SignalsMixin {
                         ),
                       );
                     }
-                    final hasKaraokeWords = model!.lines.any(
-                      (line) => line.words?.isNotEmpty ?? false,
-                    );
+                    final lyricModel = model!;
+                    final hasKaraokeWords = hasWordLevelLyrics(lyricModel);
                     final karaokeMode = forceKaraoke || hasKaraokeWords;
                     final inactiveColor = LyricsViewColors.customColorOrDefault(
                       _inactiveColorValue.value,
@@ -729,7 +728,7 @@ class _PlayerLyricsViewState extends State<PlayerLyricsView> with SignalsMixin {
                               child: SizedBox(
                                 height: 44,
                                 child: () {
-                                  final m = model;
+                                  final m = lyricModel;
                                   final showDetails =
                                       index >= 0 && index < m.lines.length;
                                   final timeText = showDetails

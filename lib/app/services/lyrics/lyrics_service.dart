@@ -19,6 +19,13 @@ import 'meizu_lyrics_service.dart';
 
 enum LyricsLoadStatus { idle, loading, loaded, empty, failed }
 
+/// 是否包含可用于逐字高亮的字词级时间轴。
+///
+/// 单个整行 token 不属于逐字歌词；至少一行有两个及以上时间片才启用逐字效果。
+bool hasWordLevelLyrics(fl.LyricModel? model) {
+  return model?.lines.any((line) => (line.words?.length ?? 0) >= 2) ?? false;
+}
+
 class LyricsSnapshot {
   final LyricsLoadStatus status;
   final SongEntity? song;

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_lyric/core/lyric_model.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:feiniu_music/app/services/lyrics/lyrics_service.dart';
 import 'package:feiniu_music/components/player/karaoke_lyric_text.dart';
 
 KaraokeHighlightPainter _highlightPainter(WidgetTester tester) {
@@ -31,11 +32,12 @@ LyricLine _buildLine() {
 Widget _buildSubject({
   required ValueNotifier<Duration> position,
   Duration? lineEnd,
+  LyricLine? line,
 }) {
   return MaterialApp(
     home: Scaffold(
       body: KaraokeLyricText(
-        line: _buildLine(),
+        line: line ?? _buildLine(),
         position: position,
         lineEnd: lineEnd,
         style: const TextStyle(fontSize: 16, color: Colors.black),
@@ -89,5 +91,44 @@ void main() {
     // Let the initial fill animation settle.
     await tester.pumpAndSettle();
     expect(_highlightPainter(tester).fraction, 1.0);
+  });
+
+  testWidgets('KaraokeLyricText highlights a non-word-timed line as a whole', (
+    tester,
+  ) async {
+    final position = ValueNotifier<Duration>(const Duration(milliseconds: 300));
+    await tester.pumpWidget(
+      _buildSubject(
+        position: position,
+        lineEnd: const Duration(seconds: 1),
+        line: LyricLine(
+          start: Duration.zero,
+          end: const Duration(seconds: 1),
+          text: '普通逐行歌词',
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(_highlightPainter(tester).fraction, 1.0);
+  });
+
+  test('hasWordLevelLyrics requires multiple timed words', () {
+    final lineOnly = LyricModel(
+      lines: [
+        LyricLine(
+          start: Duration.zero,
+          text: '普通逐行歌词',
+          words: [
+            LyricWord(
+              text: '普通逐行歌词',
+              start: Duration.zero,
+              end: const Duration(seconds: 1),
+            ),
+          ],
+        ),
+      ],
+    );
+    expect(hasWordLevelLyrics(lineOnly), isFalse);
+    expect(hasWordLevelLyrics(LyricModel(lines: [_buildLine()])), isTrue);
   });
 }

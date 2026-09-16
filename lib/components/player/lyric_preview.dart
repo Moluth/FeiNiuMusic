@@ -5,7 +5,7 @@ import 'package:flutter_lyric/widgets/lyric_view.dart';
 import '../../app/services/lyrics/lyrics_service.dart';
 import '../../app/services/lyrics/lyrics_view_colors.dart';
 
-/// 播放页 / 底部控制栏的逐字歌词预览。
+/// 播放页 / 底部控制栏的歌词预览。
 ///
 /// 直接复用歌词详情页的 [LyricView] 渲染管线（AnimationController 驱动 +
 /// CustomPainter 高亮），保证与歌词页完全一致的流畅逐字动画，而不是自研一份
@@ -17,8 +17,8 @@ import '../../app/services/lyrics/lyrics_view_colors.dart';
 ///   - 不注册 onTapLine（不做点歌词 seek）。
 ///
 /// 布局上：LyricView 会把当前播放行滚动到锚点并显示完整上下文，这里通过
-/// [clipBehavior] 裁剪到固定高度，视觉上呈现"当前行 + 前后若干行"的迷你窗口，
-/// 逐字高亮随进度平滑前进。
+/// [clipBehavior] 裁剪到固定高度，视觉上呈现"当前行 + 前后若干行"的迷你窗口。
+/// 只有歌词包含真实字词时间轴时才逐字高亮，普通 LRC 使用整行高亮。
 class LyricPreview extends StatelessWidget {
   /// 固定预览高度。
   final double height;
@@ -84,6 +84,7 @@ class LyricPreview extends StatelessWidget {
         lyrics.viewInactiveColor,
         lyrics.viewActiveColor,
         lyrics.viewHighlightColor,
+        lyrics.controller.lyricNotifier,
       ]),
       builder: (context, _) {
         final theme = Theme.of(context);
@@ -106,6 +107,9 @@ class LyricPreview extends StatelessWidget {
           context,
           inactiveColor: inactiveColor,
         );
+        final karaokeMode = hasWordLevelLyrics(
+          lyrics.controller.lyricNotifier.value,
+        );
 
         // 与歌词详情页保持同一份 LyricStyle 构造，但锁定为只读预览。
         final style = LyricStyle(
@@ -115,7 +119,7 @@ class LyricPreview extends StatelessWidget {
             height: 1.3,
           ),
           activeStyle: TextStyle(
-            color: karaokeBaseColor,
+            color: karaokeMode ? karaokeBaseColor : activeColor,
             fontSize: activeFontSize,
             fontWeight: FontWeight.w700,
             height: 1.3,
@@ -157,12 +161,14 @@ class LyricPreview extends StatelessWidget {
           activeLineOnly: activeLineOnly,
           // 关闭行切换动画：避免多个 LyricView 实例共同响应全局 switch 事件
           enableSwitchAnimation: false,
-          activeHighlightGradient: LinearGradient(
-            colors: [
-              highlightColor.withValues(alpha: 1.0),
-              highlightColor.withValues(alpha: 1.0),
-            ],
-          ),
+          activeHighlightGradient: karaokeMode
+              ? LinearGradient(
+                  colors: [
+                    highlightColor.withValues(alpha: 1.0),
+                    highlightColor.withValues(alpha: 1.0),
+                  ],
+                )
+              : null,
           activeHighlightExtraFadeWidth: 0,
         );
 

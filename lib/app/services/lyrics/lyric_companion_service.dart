@@ -19,7 +19,8 @@ import 'lyrics_repository.dart';
 class LyricCompanionService {
   LyricCompanionService._internal();
 
-  static final LyricCompanionService instance = LyricCompanionService._internal();
+  static final LyricCompanionService instance =
+      LyricCompanionService._internal();
 
   static const String _apiPath = '/music/api/v1/lyric/list';
 
@@ -81,9 +82,7 @@ class LyricCompanionService {
         if (!checkKey) return null;
         final auth = data?['auth'];
         if (auth == 'ok') return null;
-        return auth == 'missing'
-            ? '未检测到登录 token，请重新登录'
-            : '登录 token 无效或已过期';
+        return auth == 'missing' ? '未检测到登录 token，请重新登录' : '登录 token 无效或已过期';
       }
       if (response.statusCode == 401) return '登录 token 无效（HTTP 401）';
       return '服务异常（${response.statusCode}）';
@@ -153,8 +152,12 @@ class LyricCompanionService {
     return await api.getLyricText(trackGuid) ?? '';
   }
 
-  /// 写入歌词，成功后重新读取验证。
-  Future<void> saveLyrics(String guid, String content) async {
+  /// 写入歌词，成功后同步更新本地缓存。
+  Future<void> saveLyrics(
+    String guid,
+    String content, {
+    bool updateCache = true,
+  }) async {
     final base = baseUrl;
     if (base == null) throw StateError('未配置服务器地址');
     final Map<String, dynamic>? data;
@@ -163,10 +166,7 @@ class LyricCompanionService {
         '$base$_apiPath',
         data: {'guid': guid, 'content': content},
         options: Options(
-          headers: {
-            ..._authHeaders(),
-            'Content-Type': 'application/json',
-          },
+          headers: {..._authHeaders(), 'Content-Type': 'application/json'},
         ),
       );
       data = response.data;
@@ -177,13 +177,10 @@ class LyricCompanionService {
     if (code != 0) {
       throw Exception(data?['msg'] ?? '写入歌词失败');
     }
-    // 保存后重新读取验证（服务端增强可能规范化歌词内容，仅确认可读回非空）
-    final verify = await getLyrics(guid);
-    if (verify.isEmpty) {
-      throw Exception('写入后读取验证失败');
+    if (updateCache) {
+      // POST 成功即采用提交内容更新缓存，避免额外回读一次服务端。
+      await LyricsRepository().saveLrcToCache(guid, content, overwrite: true);
     }
-    // 同步更新本地歌词缓存，避免播放时 loadLrc 读到旧歌词
-    await LyricsRepository().saveLrcToCache(guid, verify, overwrite: true);
   }
 
   Map<String, String> _authHeaders() {

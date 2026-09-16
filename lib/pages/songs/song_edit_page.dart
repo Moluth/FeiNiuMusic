@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -11,10 +12,13 @@ import 'package:image_cropper/image_cropper.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../../app/utils/image_crop_helper.dart';
+import '../../app/services/cover_local_cache.dart';
 import '../../app/services/feiniu/api_client.dart';
 import '../../app/services/feiniu/api_models.dart';
 import '../../app/services/lyrics/lyric_companion_service.dart';
-import '../../app/services/companion/companion_error.dart';
+import '../../app/services/lyrics/lyrics_repository.dart';
+import '../../app/services/lyrics/lyrics_service.dart';
+import '../../app/services/player_service.dart';
 import '../../app/services/song_match/backend_match_client.dart';
 import '../../app/services/song_match/song_match_models.dart';
 import '../../app/services/song_match/song_match_scorer.dart';
@@ -71,6 +75,11 @@ class _SongEditPageState extends State<SongEditPage> {
   /// 匹配封面下载到本地的预览路径；匹配封面后本地预览，保存时上传。
   String? _matchedCoverPreviewPath;
 
+  Future<List<FeiNiuArtist>>? _pendingArtistResolution;
+  String? _pendingArtistName;
+  Future<String?>? _pendingCoverDownload;
+  String? _pendingCoverDownloadUrl;
+
   /// 缓存的本地封面 ImageProvider：跨 rebuild 复用同一实例（稳定图片缓存 key），
   /// 避免每次 build 重新创建 FileImage 导致重复解码（编辑页卡顿主因之一）。
   ImageProvider? _localCoverProvider;
@@ -90,7 +99,6 @@ class _SongEditPageState extends State<SongEditPage> {
 
   /// 歌词编辑状态（歌词修改开关开启时显示）。
   bool _lyricsLoading = false;
-  bool _lyricsSaving = false;
   late final TextEditingController _lyricsController;
 
   /// 检测服务端增强连接中 / 是否已连接（未连接时禁用歌词编辑）。
@@ -143,9 +151,13 @@ class _SongEditPageState extends State<SongEditPage> {
       final data = await _api.trackMetadata(widget.song.id);
       if (!mounted) return;
       if (data != null) {
-        final track = FeiNiuTrack.fromJson(data['track'] as Map<String, dynamic>? ?? {});
+        final track = FeiNiuTrack.fromJson(
+          data['track'] as Map<String, dynamic>? ?? {},
+        );
         final audioSpec = data['audioSpec'] != null
-            ? FeiNiuAudioSpec.fromJson(data['audioSpec'] as Map<String, dynamic>)
+            ? FeiNiuAudioSpec.fromJson(
+                data['audioSpec'] as Map<String, dynamic>,
+              )
             : null;
         _track = track;
         _audioSpec = audioSpec;
@@ -157,19 +169,39 @@ class _SongEditPageState extends State<SongEditPage> {
         if (albumName.isNotEmpty && albumName != '未知专辑') {
           _albumController.text = albumName;
         }
-        if (track.trackNo != null) _trackNoController.text = track.trackNo.toString();
-        if (track.discNo != null) _discNoController.text = track.discNo.toString();
+        if (track.trackNo != null) {
+          _trackNoController.text = track.trackNo.toString();
+        }
+        if (track.discNo != null) {
+          _discNoController.text = track.discNo.toString();
+        }
       }
     } catch (e) {
       debugPrint('[SongEditPage] load metadata error: $e');
     } finally {
       if (mounted) setState(() => _loading = false);
     }
+    _prewarmMatchCandidates();
     // 歌词读取用飞牛原接口（getLyricText），不依赖服务端增强；同时探测
     // 增强连接以决定能否编辑（写入需要增强插件）。
     if (mounted) {
       await _maybeLoadLyrics();
     }
+  }
+
+  void _prewarmMatchCandidates() {
+    final keyword = SongMatchService.instance.buildKeyword(
+      title: _titleController.text.trim(),
+      artist: _artists.map((a) => a.name).join(' '),
+      filePath: _audioSpec?.path,
+    );
+    if (keyword.isEmpty || !SongMatchService.instance.available) return;
+    unawaited(
+      SongMatchService.instance.searchCandidates(keyword).catchError((error) {
+        debugPrint('[SongEditPage] prewarm match error: $error');
+        return const GroupedSongResults(groups: []);
+      }),
+    );
   }
 
   /// 读取歌词（飞牛原接口）+ 探测服务端增强连接。
@@ -237,6 +269,9 @@ class _SongEditPageState extends State<SongEditPage> {
 
     setState(() {
       _pendingCoverPath = cropped.path; // 本地预览；保存时才上传
+      _matchedCoverPreviewPath = null;
+      _pendingCoverDownload = null;
+      _pendingCoverDownloadUrl = null;
       _refreshLocalCoverProvider(cropped.path);
     });
   }
@@ -301,26 +336,19 @@ class _SongEditPageState extends State<SongEditPage> {
         context: context,
         backgroundColor: Colors.transparent,
         isScrollControlled: true,
-        builder: (_) => CoverSearchSheet(
-          candidates: covers,
-          keyword: keyword,
-        ),
+        builder: (_) => CoverSearchSheet(candidates: covers, keyword: keyword),
       );
       if (selected == null || !mounted) return;
 
-      // 下载封面到本地临时文件预览
-      final preview = await _downloadCoverToLocal(selected.picUrl);
-      if (!mounted) return;
-      if (preview == null) {
-        AppToast.show(context, '封面下载失败', type: ToastType.error);
-        return;
-      }
+      final future = _downloadCoverToLocal(selected.picUrl);
       setState(() {
-        _matchedCoverPreviewPath = preview;
         _pendingCoverPath = null;
-        _refreshLocalCoverProvider(preview);
+        _matchedCoverPreviewPath = null;
+        _pendingCoverDownloadUrl = selected.picUrl;
+        _pendingCoverDownload = future;
       });
-      AppToast.show(context, '已选择封面，保存后生效');
+      unawaited(_applyDownloadedCover(future, selected.picUrl));
+      AppToast.show(context, '已选择封面，正在后台加载');
     } catch (e) {
       debugPrint('[SongEditPage] search cover error: $e');
       if (mounted) {
@@ -359,7 +387,9 @@ class _SongEditPageState extends State<SongEditPage> {
         // 转码失败用原字节（PNG/JPEG 也能直接用）
       }
       final dir = await getTemporaryDirectory();
-      final file = File('${dir.path}/cover_${DateTime.now().millisecondsSinceEpoch}.jpg');
+      final file = File(
+        '${dir.path}/cover_${DateTime.now().millisecondsSinceEpoch}.jpg',
+      );
       await file.writeAsBytes(out);
       return file.path;
     } catch (e) {
@@ -378,7 +408,11 @@ class _SongEditPageState extends State<SongEditPage> {
       builder: (_) => _ArtistPickerSheet(initial: _artists),
     );
     if (selected != null && mounted) {
-      setState(() => _artists = selected);
+      setState(() {
+        _artists = selected;
+        _pendingArtistResolution = null;
+        _pendingArtistName = null;
+      });
     }
   }
 
@@ -427,27 +461,23 @@ class _SongEditPageState extends State<SongEditPage> {
         builder: (_) => _MatchCandidateSheet(
           grouped: grouped,
           keyword: keyword,
-          onSearch: (kw, page) async =>
-              (await SongMatchService.instance.searchCandidates(kw, page: page)),
+          onSearch: (kw, page) async => (await SongMatchService.instance
+              .searchCandidates(kw, page: page)),
         ),
       );
       if (selected == null || !mounted) return;
 
-      // 歌词修改开启时，候选选中即同步预取歌词（应用时直接使用，不再二次搜索）。
-      // 歌词预取走数据源插件（getLyricsCandidates），与 nginx /music-enhance 的服务端增强
-      // 无关，故不 gate 于 checkConnected()；连接状态只影响弹层里「未连接到增强
-      // 插件」提示与是否可勾选歌词（决定能否写入 NAS）。
-      String? prefetchedLyrics;
-      bool companionConnected = false;
-      if (LyricCompanionSettings.enabled.value) {
-        companionConnected =
-            await LyricCompanionService.instance.checkConnected();
-        final kwTitle = selected.title.isNotEmpty ? selected.title : _titleController.text.trim();
-        final kwArtist = selected.artist.isNotEmpty ? selected.artist : _artists.map((a) => a.name).join(' ');
-        prefetchedLyrics = await SongMatchService.instance.fetchLyrics(
-          title: kwTitle,
-          artist: kwArtist,
+      String? matchedLyrics;
+      if (_canEditLyrics) {
+        matchedLyrics = await SongMatchService.instance.fetchLyrics(
+          title: selected.title.isNotEmpty
+              ? selected.title
+              : _titleController.text.trim(),
+          artist: selected.artist.isNotEmpty
+              ? selected.artist
+              : _artists.map((artist) => artist.name).join(' '),
           album: selected.album,
+          duration: selected.duration,
           sourceId: selected.id,
           sourceInternal: selected.internal,
           sourceFields: selected.normalizedFields,
@@ -467,92 +497,86 @@ class _SongEditPageState extends State<SongEditPage> {
           currentArtist: _artists.map((a) => a.name).join(' / '),
           currentAlbum: _albumController.text.trim(),
           currentYear: _yearController.text.trim(),
-          currentCoverUrl: _displayCoverId != null && _displayCoverId!.isNotEmpty
-              ? _api.coverUrl(_displayCoverId!, size: FeiNiuApiClient.coverRequestSize)
+          currentCoverUrl:
+              _displayCoverId != null && _displayCoverId!.isNotEmpty
+              ? _api.coverUrl(
+                  _displayCoverId!,
+                  size: FeiNiuApiClient.coverRequestSize,
+                )
               : null,
           currentLyrics: _lyricsController.text,
           currentTrackNo: _trackNoController.text.trim(),
           currentDiscNo: _discNoController.text.trim(),
-          prefetchedLyrics: prefetchedLyrics,
-          companionConnected: companionConnected,
+          canMatchLyrics: _canEditLyrics,
+          matchedLyrics: matchedLyrics,
         ),
       );
       if (fields == null || !mounted) return;
 
-      final patch = await SongMatchService.instance
-          .buildPatch(selected, downloadCover: fields.contains(MatchField.cover));
-      if (!mounted) return;
+      final appliesArtist =
+          fields.contains(MatchField.artist) && selected.artist.isNotEmpty;
+      final appliesCover =
+          fields.contains(MatchField.cover) && selected.picUrl.isNotEmpty;
+      final appliesLyrics =
+          fields.contains(MatchField.lyrics) &&
+          matchedLyrics != null &&
+          matchedLyrics.isNotEmpty;
 
-      // 回填表单（仅勾选字段）
+      // 文本和已获取的歌词立即回填；实体解析与封面下载在后台继续。
       setState(() {
-        if (fields.contains(MatchField.title) && patch.title.isNotEmpty) {
-          _titleController.text = patch.title;
+        if (fields.contains(MatchField.title) && selected.title.isNotEmpty) {
+          _titleController.text = selected.title;
         }
-        if (fields.contains(MatchField.album) && patch.album.isNotEmpty) {
-          _albumController.text = patch.album;
+        if (fields.contains(MatchField.album) && selected.album.isNotEmpty) {
+          _albumController.text = selected.album;
         }
-        if (fields.contains(MatchField.year) && patch.year.isNotEmpty) {
-          _yearController.text = patch.year;
+        if (fields.contains(MatchField.year) && selected.date.isNotEmpty) {
+          _yearController.text = selected.date;
         }
         if (fields.contains(MatchField.trackNumber) &&
-            patch.trackNumber.isNotEmpty) {
-          _trackNoController.text = patch.trackNumber;
+            selected.trackNumber.isNotEmpty) {
+          _trackNoController.text = selected.trackNumber;
         }
         if (fields.contains(MatchField.discNumber) &&
-            patch.discNumber.isNotEmpty) {
-          _discNoController.text = patch.discNumber;
+            selected.discNumber.isNotEmpty) {
+          _discNoController.text = selected.discNumber;
+        }
+        if (appliesArtist) {
+          _artists = selected.artist
+              .split('/')
+              .map((name) => name.trim())
+              .where((name) => name.isNotEmpty)
+              .map((name) => FeiNiuArtist(guid: '', name: name))
+              .toList();
+        }
+        if (appliesLyrics) {
+          _lyricsController.text = matchedLyrics!;
+          _lyricsDirty = true;
         }
       });
 
-      // 解析歌手 → FeiNiuArtist（仅勾选歌手字段且匹配到才应用）
-      if (fields.contains(MatchField.artist) && patch.artist.isNotEmpty) {
-        final resolved =
-            await SongMatchService.instance.resolveArtists(patch.artist);
-        if (mounted && resolved.isNotEmpty) {
-          setState(() => _artists = resolved);
-        }
+      if (appliesArtist) {
+        final future = SongMatchService.instance.resolveArtists(
+          selected.artist,
+        );
+        _pendingArtistName = selected.artist;
+        _pendingArtistResolution = future;
+        unawaited(_applyResolvedArtists(future, selected.artist));
       }
 
-      // 封面：仅勾选封面字段且有封面时下载预览（保存时上传）。
-      if (fields.contains(MatchField.cover) &&
-          patch.coverUrl != null &&
-          patch.coverUrl!.isNotEmpty) {
-        try {
-          final preview = await _downloadCoverToLocal(patch.coverUrl!);
-          if (!mounted) return;
-          if (preview != null) {
-            setState(() {
-              _matchedCoverPreviewPath = preview;
-              _pendingCoverPath = null;
-              _refreshLocalCoverProvider(preview);
-            });
-            AppToast.show(context, '已匹配并更新封面预览');
-          }
-        } catch (e) {
-          debugPrint('[SongEditPage] cover download error: $e');
-          if (mounted) {
-            AppToast.show(context, '封面预览失败，其余已匹配', type: ToastType.error);
-          }
-        }
-      } else {
-        if (mounted) AppToast.show(context, '已匹配歌曲信息');
+      if (appliesCover) {
+        final future = _downloadCoverToLocal(selected.picUrl);
+        _pendingCoverPath = null;
+        _matchedCoverPreviewPath = null;
+        _pendingCoverDownloadUrl = selected.picUrl;
+        _pendingCoverDownload = future;
+        unawaited(_applyDownloadedCover(future, selected.picUrl));
       }
 
-      // 歌词：勾选歌词字段且歌词修改已开启时，用候选选中时预取的歌词填充
-      if (fields.contains(MatchField.lyrics) &&
-          LyricCompanionSettings.enabled.value) {
-        if (prefetchedLyrics != null && prefetchedLyrics.isNotEmpty) {
-          setState(() {
-            _lyricsController.text = prefetchedLyrics!;
-            _lyricsDirty = true;
-          });
-          if (mounted) AppToast.show(context, '已匹配歌词（保存时写入）');
-        } else {
-          if (mounted) {
-            AppToast.show(context, '未获取到歌词（检查数据源插件）', type: ToastType.error);
-          }
-        }
-      }
+      AppToast.show(
+        context,
+        appliesCover || appliesArtist ? '已应用，相关内容正在后台处理' : '已应用歌曲信息',
+      );
     } catch (e) {
       debugPrint('[SongEditPage] match error: $e');
       if (mounted) {
@@ -563,6 +587,41 @@ class _SongEditPageState extends State<SongEditPage> {
     }
   }
 
+  Future<void> _applyResolvedArtists(
+    Future<List<FeiNiuArtist>> future,
+    String artistName,
+  ) async {
+    try {
+      final resolved = await future;
+      if (!mounted ||
+          !identical(_pendingArtistResolution, future) ||
+          _pendingArtistName != artistName ||
+          resolved.isEmpty) {
+        return;
+      }
+      setState(() => _artists = resolved);
+    } catch (error) {
+      debugPrint('[SongEditPage] resolve artists error: $error');
+    }
+  }
+
+  Future<void> _applyDownloadedCover(
+    Future<String?> future,
+    String coverUrl,
+  ) async {
+    final preview = await future;
+    if (!mounted ||
+        !identical(_pendingCoverDownload, future) ||
+        _pendingCoverDownloadUrl != coverUrl ||
+        preview == null) {
+      return;
+    }
+    setState(() {
+      _matchedCoverPreviewPath = preview;
+      _refreshLocalCoverProvider(preview);
+    });
+  }
+
   // ── 保存 ────────────────────────────────────────────────────────
 
   Future<void> _save() async {
@@ -570,91 +629,52 @@ class _SongEditPageState extends State<SongEditPage> {
     if (!(_formKey.currentState?.validate() ?? false)) return;
 
     setState(() => _saving = true);
-    try {
-      // 换图了 → 先上传拿新 coverId；未换图 → 保留原 coverId
-      String? newCoverId;
-      if (_pendingCoverPath != null) {
-        final bytes = await File(_pendingCoverPath!).readAsBytes();
-        newCoverId = await _api.uploadTrackCover(bytes);
-      } else if (_matchedCoverPreviewPath != null) {
-        // 匹配/联网搜索选择的封面：本地预览文件，保存时上传
-        final bytes = await File(_matchedCoverPreviewPath!).readAsBytes();
-        newCoverId = await _api.uploadTrackCover(bytes);
-      }
-
-      // 未换图时沿用原曲目 coverId（可能为 null，由服务端决定保留原封面）
-      final coverId = newCoverId ?? _displayCoverId;
-
-      // 专辑：解析 album 名 → guid（匹配不到且服务端增强可用时自动新建），
-      // 避免服务端按字符串隐式新建出重复专辑。
-      String? albumGuid;
-      final albumText = _albumController.text.trim();
-      if (albumText.isNotEmpty) {
-        albumGuid =
-            (await SongMatchService.instance.resolveAlbum(albumText))?.guid;
-      }
-
-      final body = <String, dynamic>{
-        'guid': widget.song.id,
-        'title': _titleController.text.trim(),
-        'album': albumText,
-        if (albumGuid != null && albumGuid.isNotEmpty) 'albumGUID': albumGuid,
-        'artistGUIDs': _artists.map((a) => a.guid).toList(),
-        'genreGUIDs': _genres.map((g) => g.guid).toList(),
-        'year': int.tryParse(_yearController.text.trim()),
-        'trackNo': int.tryParse(_trackNoController.text.trim()),
-        'discNo': int.tryParse(_discNoController.text.trim()),
-        if (coverId != null && coverId.isNotEmpty)
-          'coverId': coverId,
-        if (coverId != null && coverId.isNotEmpty)
-          'coverGUID': FeiNiuApiClient.deriveCoverGuid(coverId),
-      };
-
-      await _api.updateTrackMetadata(body);
-
-      // 歌词修改过且可编辑（增强开启 + 连接）则随保存统一写入（未修改跳过）。
-      if (_lyricsDirty && _canEditLyrics) {
-        await _saveLyrics();
-      }
-
-      // 构造更新后的 SongEntity 返回
-      final artistJson = jsonEncode(
-        _artists
-            .map((a) => {
-                  'guid': a.guid,
-                  'name': a.name,
-                  if (a.coverId != null && a.coverId!.isNotEmpty)
-                    'coverId': a.coverId,
-                })
-            .toList(),
-      );
-      final originalAlbumGuid = widget.song.albumGuid;
-      final albumJson = jsonEncode({
+    final title = _titleController.text.trim();
+    final albumName = _albumController.text.trim();
+    final artists = List<FeiNiuArtist>.of(_artists);
+    final trackNumber = int.tryParse(_trackNoController.text.trim());
+    final discNumber = int.tryParse(_discNoController.text.trim());
+    final originalAlbumGuid = widget.song.albumDisplayName == albumName
+        ? widget.song.albumGuid
+        : null;
+    final optimistic = widget.song.copyWith(
+      title: title,
+      artist: _encodeArtists(artists),
+      album: jsonEncode({
         if (originalAlbumGuid != null && originalAlbumGuid.isNotEmpty)
           'guid': originalAlbumGuid,
-        'name': _albumController.text.trim(),
-      });
-      final updated = widget.song.copyWith(
-        title: _titleController.text.trim(),
-        artist: artistJson,
-        album: albumJson,
-        coverId: coverId ?? widget.song.coverId,
-        trackNumber: int.tryParse(_trackNoController.text.trim()),
-        discNumber: int.tryParse(_discNoController.text.trim()),
-        updatedAt: DateTime.now().millisecondsSinceEpoch,
-      );
+        'name': albumName,
+      }),
+      coverId: _displayCoverId ?? widget.song.coverId,
+      trackNumber: trackNumber,
+      discNumber: discNumber,
+      updatedAt: DateTime.now().millisecondsSinceEpoch,
+    );
+    final request = _SongEditSyncRequest(
+      original: widget.song,
+      optimistic: optimistic,
+      title: title,
+      albumName: albumName,
+      artists: artists,
+      pendingArtistResolution: artists.any((artist) => artist.guid.isEmpty)
+          ? _pendingArtistResolution
+          : null,
+      genreGuids: _genres.map((genre) => genre.guid).toList(),
+      year: int.tryParse(_yearController.text.trim()),
+      trackNumber: trackNumber,
+      discNumber: discNumber,
+      existingCoverId: _displayCoverId,
+      coverPath: _pendingCoverPath ?? _matchedCoverPreviewPath,
+      pendingCoverDownload: _pendingCoverPath == null
+          ? _pendingCoverDownload
+          : null,
+      lyrics: _lyricsController.text,
+      saveLyrics: _canEditLyrics && _lyricsDirty,
+    );
 
-      if (!mounted) return;
-      AppToast.show(context, '已保存');
-      Navigator.of(context).pop(updated);
-    } catch (e) {
-      debugPrint('[SongEditPage] save error: $e');
-      if (mounted) {
-        AppToast.show(context, '保存失败：$e', type: ToastType.error);
-      }
-    } finally {
-      if (mounted) setState(() => _saving = false);
-    }
+    AppToast.show(context, '已保存，正在后台同步');
+    Navigator.of(context).pop(optimistic);
+    unawaited(_persistSongEdit(request));
   }
 
   // ── UI ──────────────────────────────────────────────────────────
@@ -714,7 +734,9 @@ class _SongEditPageState extends State<SongEditPage> {
                               ? const SizedBox(
                                   width: 18,
                                   height: 18,
-                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
                                 )
                               : const Icon(Icons.check_rounded),
                           label: Text(_saving ? '保存中…' : '保存'),
@@ -776,9 +798,7 @@ class _SongEditPageState extends State<SongEditPage> {
         color: theme.cardColor,
         borderRadius: BorderRadius.circular(20),
       ),
-      child: Center(
-        child: _buildCover(theme),
-      ),
+      child: Center(child: _buildCover(theme)),
     );
   }
 
@@ -1010,9 +1030,9 @@ class _SongEditPageState extends State<SongEditPage> {
         children: [
           Text(
             '编辑信息',
-            style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                  fontWeight: FontWeight.w700,
-                ),
+            style: Theme.of(
+              context,
+            ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
           ),
           const SizedBox(height: 12),
           // 「匹配歌曲信息」依赖数据源插件（原生 QuickJS），非 Android 隐藏。
@@ -1059,8 +1079,9 @@ class _SongEditPageState extends State<SongEditPage> {
             icon: Icons.category_outlined,
             chips: _genres.map((g) => g.name).toList(),
             onAdd: _showGenrePicker,
-            onRemove:
-                _genres.isEmpty ? null : () => setState(() => _genres = []),
+            onRemove: _genres.isEmpty
+                ? null
+                : () => setState(() => _genres = []),
           ),
           const SizedBox(height: 14),
           _buildTextField(
@@ -1201,9 +1222,11 @@ class _SongEditPageState extends State<SongEditPage> {
     if (_lyricsLoading) return;
     setState(() => _lyricsLoading = true);
     try {
-      final content =
-          await LyricCompanionService.instance.getLyrics(widget.song.id);
+      final content = await LyricCompanionService.instance.getLyrics(
+        widget.song.id,
+      );
       if (!mounted) return;
+      if (_lyricsDirty) return;
       setState(() {
         _lyricsController.text = content;
         _lyricsDirty = false;
@@ -1218,32 +1241,6 @@ class _SongEditPageState extends State<SongEditPage> {
       }
     } finally {
       if (mounted) setState(() => _lyricsLoading = false);
-    }
-  }
-
-  /// 保存歌词（写入服务端增强，重新读取验证）。
-  ///
-  /// 仅在歌词被修改过时调用（随主「保存」按钮统一提交）；未修改则跳过。
-  Future<void> _saveLyrics() async {
-    if (_lyricsSaving || _lyricsLoading || !_lyricsDirty) return;
-    setState(() => _lyricsSaving = true);
-    try {
-      await LyricCompanionService.instance
-          .saveLyrics(widget.song.id, _lyricsController.text);
-      if (!mounted) return;
-      _lyricsDirty = false;
-    } catch (e) {
-      debugPrint('[SongEditPage] save lyrics error: $e');
-      if (mounted) {
-        AppToast.show(
-          context,
-          '歌词保存失败：${friendlyCompanionError(e)}',
-          type: ToastType.error,
-        );
-        rethrow;
-      }
-    } finally {
-      if (mounted) setState(() => _lyricsSaving = false);
     }
   }
 
@@ -1277,7 +1274,11 @@ class _SongEditPageState extends State<SongEditPage> {
       children: [
         Row(
           children: [
-            Icon(Icons.person_outline, size: 20, color: theme.colorScheme.primary),
+            Icon(
+              Icons.person_outline,
+              size: 20,
+              color: theme.colorScheme.primary,
+            ),
             const SizedBox(width: 8),
             Text(
               '歌手',
@@ -1295,8 +1296,7 @@ class _SongEditPageState extends State<SongEditPage> {
           runSpacing: 14,
           crossAxisAlignment: WrapCrossAlignment.center,
           children: [
-            for (final artist in _artists)
-              _buildArtistItem(theme, artist),
+            for (final artist in _artists) _buildArtistItem(theme, artist),
             InkWell(
               onTap: _showArtistPicker,
               borderRadius: BorderRadius.circular(12),
@@ -1358,8 +1358,10 @@ class _SongEditPageState extends State<SongEditPage> {
             onTap: () {
               setState(() {
                 _artists = _artists
-                    .where((a) => a.guid != artist.guid)
+                    .where((item) => !identical(item, artist))
                     .toList();
+                _pendingArtistResolution = null;
+                _pendingArtistName = null;
               });
             },
             child: Container(
@@ -1369,8 +1371,9 @@ class _SongEditPageState extends State<SongEditPage> {
                 color: theme.colorScheme.surfaceContainerHighest,
                 shape: BoxShape.circle,
                 border: Border.all(
-                  color: theme.colorScheme.onSurfaceVariant
-                      .withValues(alpha: 0.4),
+                  color: theme.colorScheme.onSurfaceVariant.withValues(
+                    alpha: 0.4,
+                  ),
                 ),
               ),
               child: Icon(
@@ -1453,6 +1456,169 @@ class _SongEditPageState extends State<SongEditPage> {
     final hh = dt.hour.toString().padLeft(2, '0');
     final mm = dt.minute.toString().padLeft(2, '0');
     return '$y-$m-$d $hh:$mm';
+  }
+}
+
+class _SongEditSyncRequest {
+  final SongEntity original;
+  final SongEntity optimistic;
+  final String title;
+  final String albumName;
+  final List<FeiNiuArtist> artists;
+  final Future<List<FeiNiuArtist>>? pendingArtistResolution;
+  final List<String> genreGuids;
+  final int? year;
+  final int? trackNumber;
+  final int? discNumber;
+  final String? existingCoverId;
+  final String? coverPath;
+  final Future<String?>? pendingCoverDownload;
+  final String lyrics;
+  final bool saveLyrics;
+
+  const _SongEditSyncRequest({
+    required this.original,
+    required this.optimistic,
+    required this.title,
+    required this.albumName,
+    required this.artists,
+    required this.pendingArtistResolution,
+    required this.genreGuids,
+    required this.year,
+    required this.trackNumber,
+    required this.discNumber,
+    required this.existingCoverId,
+    required this.coverPath,
+    required this.pendingCoverDownload,
+    required this.lyrics,
+    required this.saveLyrics,
+  });
+}
+
+String _encodeArtists(List<FeiNiuArtist> artists) {
+  return jsonEncode(
+    artists
+        .map(
+          (artist) => {
+            'guid': artist.guid,
+            'name': artist.name,
+            if (artist.coverId != null && artist.coverId!.isNotEmpty)
+              'coverId': artist.coverId,
+          },
+        )
+        .toList(),
+  );
+}
+
+Future<void> _persistSongEdit(_SongEditSyncRequest request) async {
+  final matchService = SongMatchService.instance;
+  final api = FeiNiuApiClient.instance;
+
+  try {
+    if (request.saveLyrics) {
+      await LyricsRepository().saveLrcToCache(
+        request.original.id,
+        request.lyrics,
+        overwrite: true,
+      );
+      if (PlayerService.instance.currentSong.value?.id == request.original.id) {
+        LyricsService.instance.reloadCurrentSong();
+      }
+    }
+
+    final unresolvedArtists = request.artists.any(
+      (artist) => artist.guid.isEmpty,
+    );
+    final artistFuture = unresolvedArtists
+        ? request.pendingArtistResolution ??
+              matchService.resolveArtists(
+                request.artists.map((artist) => artist.name).join('/'),
+              )
+        : Future<List<FeiNiuArtist>>.value(request.artists);
+    final unchangedAlbumGuid =
+        request.original.albumDisplayName == request.albumName
+        ? request.original.albumGuid
+        : null;
+    final albumFuture = request.albumName.isEmpty
+        ? Future<FeiNiuAlbum?>.value()
+        : unchangedAlbumGuid != null && unchangedAlbumGuid.isNotEmpty
+        ? Future<FeiNiuAlbum?>.value(
+            FeiNiuAlbum(guid: unchangedAlbumGuid, name: request.albumName),
+          )
+        : matchService.resolveAlbum(request.albumName);
+    final coverPathFuture =
+        request.pendingCoverDownload ??
+        Future<String?>.value(request.coverPath);
+
+    final artists = await artistFuture;
+    if (unresolvedArtists && artists.isEmpty) {
+      throw StateError('无法解析匹配到的歌手');
+    }
+    final album = await albumFuture;
+    final coverPath = await coverPathFuture;
+    if (request.pendingCoverDownload != null && coverPath == null) {
+      throw StateError('匹配封面下载失败');
+    }
+    var coverId = request.existingCoverId;
+    if (coverPath != null && coverPath.isNotEmpty) {
+      coverId = await api.uploadTrackCover(await File(coverPath).readAsBytes());
+    }
+
+    final albumGuid = album?.guid ?? unchangedAlbumGuid;
+    final updatedAt = DateTime.now().millisecondsSinceEpoch;
+    final persisted = request.optimistic.copyWith(
+      artist: _encodeArtists(artists),
+      album: jsonEncode({
+        if (albumGuid != null && albumGuid.isNotEmpty) 'guid': albumGuid,
+        'name': request.albumName,
+      }),
+      coverId: coverId ?? request.optimistic.coverId,
+      updatedAt: updatedAt,
+    );
+    if (coverId != null &&
+        coverId.isNotEmpty &&
+        coverPath != null &&
+        coverPath.isNotEmpty) {
+      await CoverLocalCache.seedMatchedCover(
+        coverId,
+        coverPath,
+        updatedAt: updatedAt,
+      );
+    }
+
+    // 本地数据库、播放器队列和歌词缓存先更新，UI 不等待服务端元数据写入。
+    await PlayerService.instance.updateSongMetadata(persisted);
+
+    final serverWrites = <Future<void>>[
+      api.updateTrackMetadata({
+        'guid': request.original.id,
+        'title': request.title,
+        'album': request.albumName,
+        if (album != null && album.guid.isNotEmpty) 'albumGUID': album.guid,
+        'artistGUIDs': artists.map((artist) => artist.guid).toList(),
+        'genreGUIDs': request.genreGuids,
+        'year': request.year,
+        'trackNo': request.trackNumber,
+        'discNo': request.discNumber,
+        if (coverId != null && coverId.isNotEmpty) 'coverId': coverId,
+        if (coverId != null && coverId.isNotEmpty)
+          'coverGUID': FeiNiuApiClient.deriveCoverGuid(coverId),
+      }),
+      if (request.saveLyrics)
+        LyricCompanionService.instance.saveLyrics(
+          request.original.id,
+          request.lyrics,
+          updateCache: false,
+        ),
+    ];
+    await Future.wait(serverWrites);
+  } catch (error) {
+    debugPrint('[SongEditPage] background save error: $error');
+    AppToast.showGlobal(
+      '后台保存失败：$error',
+      type: ToastType.error,
+      duration: const Duration(seconds: 4),
+    );
   }
 }
 
@@ -1574,9 +1740,7 @@ class _ArtistPickerSheetState extends State<_ArtistPickerSheet> {
     final filtered = _query.isEmpty
         ? _all
         : _all
-              .where(
-                (a) => a.name.toLowerCase().contains(_query.toLowerCase()),
-              )
+              .where((a) => a.name.toLowerCase().contains(_query.toLowerCase()))
               .toList();
 
     return Container(
@@ -1727,7 +1891,10 @@ class _ArtistAvatarWidget extends StatelessWidget {
     final radius = size / 2;
     final initial = name.isNotEmpty ? name.characters.first : '?';
     if (coverId != null && coverId!.isNotEmpty) {
-      final coverUrl = FeiNiuApiClient.instance.coverUrl(coverId!, size: FeiNiuApiClient.coverRequestSize);
+      final coverUrl = FeiNiuApiClient.instance.coverUrl(
+        coverId!,
+        size: FeiNiuApiClient.coverRequestSize,
+      );
       // 有封面时不叠加名字首字，仅显示头像图片。
       return CircleAvatar(
         radius: radius,
@@ -1786,9 +1953,7 @@ class _GenrePickerSheetState extends State<_GenrePickerSheet> {
     final filtered = _query.isEmpty
         ? _all
         : _all
-              .where(
-                (g) => g.name.toLowerCase().contains(_query.toLowerCase()),
-              )
+              .where((g) => g.name.toLowerCase().contains(_query.toLowerCase()))
               .toList();
 
     return Container(
@@ -2009,11 +2174,13 @@ class _MatchCandidateSheetState extends State<_MatchCandidateSheet> {
                 .where((g) => g.pluginId == group.pluginId)
                 .expand((g) => g.results)
                 .toList();
-            merged.add(SourceGroup(
-              pluginId: group.pluginId,
-              pluginName: group.pluginName,
-              results: [...group.results, ...added],
-            ));
+            merged.add(
+              SourceGroup(
+                pluginId: group.pluginId,
+                pluginName: group.pluginName,
+                results: [...group.results, ...added],
+              ),
+            );
           }
           _grouped = GroupedSongResults(groups: merged);
           _page += 1;
@@ -2114,10 +2281,12 @@ class _MatchCandidateSheetState extends State<_MatchCandidateSheet> {
     for (var i = 0; i < _grouped.groups.length; i++) {
       final group = _grouped.groups[i];
       if (group.results.isEmpty) continue;
-      tabs.add(Padding(
-        padding: const EdgeInsets.fromLTRB(4, 0, 4, 8),
-        child: _sourceChip(theme, i + 1, group.pluginName),
-      ));
+      tabs.add(
+        Padding(
+          padding: const EdgeInsets.fromLTRB(4, 0, 4, 8),
+          child: _sourceChip(theme, i + 1, group.pluginName),
+        ),
+      );
     }
     return SizedBox(
       height: 40,
@@ -2152,33 +2321,32 @@ class _MatchCandidateSheetState extends State<_MatchCandidateSheet> {
   }
 
   /// 渲染当前激活 tab 的候选列表。
-  Widget _buildActiveList(
-    ScrollController scrollController,
-    ThemeData theme,
-  ) {
+  Widget _buildActiveList(ScrollController scrollController, ThemeData theme) {
     final rows = <Widget>[];
     for (final candidate in _activeList()) {
       rows.add(_candidateTile(candidate));
     }
     if (_hasMore) {
-      rows.add(Padding(
-        key: const ValueKey('load-more'),
-        padding: const EdgeInsets.symmetric(vertical: 12),
-        child: Center(
-          child: _loadingMore
-              ? const SizedBox(
-                  width: 20,
-                  height: 20,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                )
-              : Text(
-                  '上拉加载更多',
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant,
+      rows.add(
+        Padding(
+          key: const ValueKey('load-more'),
+          padding: const EdgeInsets.symmetric(vertical: 12),
+          child: Center(
+            child: _loadingMore
+                ? const SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : Text(
+                    '上拉加载更多',
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
                   ),
-                ),
+          ),
         ),
-      ));
+      );
     }
     return NotificationListener<ScrollNotification>(
       onNotification: (notification) {
@@ -2295,12 +2463,15 @@ class _CoverSearchSheetState extends State<CoverSearchSheet> {
                     final candidate = widget.candidates[index];
                     final url = candidate.picUrl;
                     return InkWell(
-                      onTap: url.isEmpty ? null : () => Navigator.of(context).pop(candidate),
+                      onTap: url.isEmpty
+                          ? null
+                          : () => Navigator.of(context).pop(candidate),
                       borderRadius: BorderRadius.circular(12),
                       child: url.isEmpty
                           ? Container(
                               decoration: BoxDecoration(
-                                color: theme.colorScheme.surfaceContainerHighest,
+                                color:
+                                    theme.colorScheme.surfaceContainerHighest,
                                 borderRadius: BorderRadius.circular(12),
                               ),
                               child: const Center(
@@ -2311,22 +2482,26 @@ class _CoverSearchSheetState extends State<CoverSearchSheet> {
                               imageUrl: url,
                               fit: BoxFit.cover,
                               placeholder: (_, _) => Container(
-                                color: theme.colorScheme.surfaceContainerHighest,
+                                color:
+                                    theme.colorScheme.surfaceContainerHighest,
                               ),
                               errorWidget: (_, _, _) => Container(
-                                color: theme.colorScheme.surfaceContainerHighest,
+                                color:
+                                    theme.colorScheme.surfaceContainerHighest,
                                 child: const Center(
-                                  child: Icon(Icons.image_not_supported_outlined),
+                                  child: Icon(
+                                    Icons.image_not_supported_outlined,
+                                  ),
                                 ),
                               ),
-                        ),
-                );
-              },
-            ),
+                            ),
+                    );
+                  },
+                ),
+              ),
+            ],
           ),
-        ],
-      ),
-    );
+        );
       },
     );
   }
@@ -2346,11 +2521,9 @@ class _MatchApplySheet extends StatefulWidget {
   final String currentTrackNo;
   final String currentDiscNo;
 
-  /// 候选选中时同步预取的歌词（LRC）；未获取时为 null。
-  final String? prefetchedLyrics;
-
-  /// 服务端增强是否已连接（未连接时歌词字段显示「未连接到增强插件」并禁用）。
-  final bool companionConnected;
+  /// 服务端增强已连接时可应用已匹配到的歌词。
+  final bool canMatchLyrics;
+  final String? matchedLyrics;
 
   const _MatchApplySheet({
     required this.candidate,
@@ -2362,8 +2535,8 @@ class _MatchApplySheet extends StatefulWidget {
     this.currentLyrics = '',
     this.currentTrackNo = '',
     this.currentDiscNo = '',
-    this.prefetchedLyrics,
-    this.companionConnected = false,
+    this.canMatchLyrics = false,
+    this.matchedLyrics,
   });
 
   @override
@@ -2385,9 +2558,9 @@ class _MatchApplySheetState extends State<_MatchApplySheet> {
       if (c.trackNumber.isNotEmpty) MatchField.trackNumber,
       if (c.discNumber.isNotEmpty) MatchField.discNumber,
       if (c.picUrl.isNotEmpty) MatchField.cover,
-      if (LyricCompanionSettings.enabled.value &&
-          widget.prefetchedLyrics != null &&
-          widget.prefetchedLyrics!.isNotEmpty)
+      if (widget.canMatchLyrics &&
+          widget.matchedLyrics != null &&
+          widget.matchedLyrics!.isNotEmpty)
         MatchField.lyrics,
     ];
     return result;
@@ -2429,126 +2602,135 @@ class _MatchApplySheetState extends State<_MatchApplySheet> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
-            child: Text(
-              '「${c.title}」· ${c.artist}',
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-            ),
-          ),
-          const Divider(height: 1),
-          // 全选 / 取消全选（仅对候选有数据的字段生效）——按钮放右边
-          Padding(
-            padding: const EdgeInsets.fromLTRB(8, 0, 8, 0),
-            child: Align(
-              alignment: Alignment.centerRight,
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    '全选',
-                    style: theme.textTheme.bodyMedium,
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
+                child: Text(
+                  '「${c.title}」· ${c.artist}',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
                   ),
-                  Checkbox(
-                    value: _allEnabledSelected,
-                    tristate: true,
-                    onChanged: (v) => _toggleAll(v ?? false),
-                  ),
-                ],
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
               ),
-            ),
-          ),
-          Flexible(
-            child: ListView(
-              controller: scrollController,
-              shrinkWrap: true,
-              children: [
-                // 封面放最上面：显示候选封面图片 + 勾选
-                _coverTile(context),
-                _fieldTile(
-                  context,
-                  MatchField.title,
-                  '标题',
-                  widget.currentTitle,
-                  c.title,
-                  enabled: c.title.isNotEmpty,
-                ),
-                _fieldTile(
-                  context,
-                  MatchField.artist,
-                  '歌手',
-                  widget.currentArtist,
-                  c.artist,
-                  enabled: c.artist.isNotEmpty,
-                ),
-                _fieldTile(
-                  context,
-                  MatchField.album,
-                  '专辑',
-                  widget.currentAlbum,
-                  c.album,
-                  enabled: c.album.isNotEmpty,
-                ),
-                _fieldTile(
-                  context,
-                  MatchField.year,
-                  '年份',
-                  widget.currentYear,
-                  c.date,
-                  enabled: c.date.isNotEmpty,
-                ),
-                _fieldTile(
-                  context,
-                  MatchField.trackNumber,
-                  '歌曲序号',
-                  widget.currentTrackNo.isEmpty ? '无' : widget.currentTrackNo,
-                  c.trackNumber.isEmpty ? '无序号' : '第 ${c.trackNumber} 首',
-                  enabled: c.trackNumber.isNotEmpty,
-                ),
-                _fieldTile(
-                  context,
-                  MatchField.discNumber,
-                  '光盘序号',
-                  widget.currentDiscNo.isEmpty ? '无' : widget.currentDiscNo,
-                  c.discNumber.isEmpty ? '无碟号' : '碟号 ${c.discNumber}',
-                  enabled: c.discNumber.isNotEmpty,
-                ),
-                if (LyricCompanionSettings.enabled.value)
-                  _fieldTile(
-                    context,
-                    MatchField.lyrics,
-                    '歌词',
-                    widget.currentLyrics.isEmpty ? '无' : '有（${widget.currentLyrics.length} 字符）',
-                    widget.prefetchedLyrics == null || widget.prefetchedLyrics!.isEmpty
-                        ? '未获取到歌词'
-                        : '已匹配（${widget.prefetchedLyrics!.length} 字符）',
-                    enabled: widget.prefetchedLyrics != null &&
-                        widget.prefetchedLyrics!.isNotEmpty,
-                    note: widget.companionConnected ? null : '未连接到增强插件（写入 NAS 不可用）',
+              const Divider(height: 1),
+              // 全选 / 取消全选（仅对候选有数据的字段生效）——按钮放右边
+              Padding(
+                padding: const EdgeInsets.fromLTRB(8, 0, 8, 0),
+                child: Align(
+                  alignment: Alignment.centerRight,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text('全选', style: theme.textTheme.bodyMedium),
+                      Checkbox(
+                        value: _allEnabledSelected,
+                        tristate: true,
+                        onChanged: (v) => _toggleAll(v ?? false),
+                      ),
+                    ],
                   ),
-              ],
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
-            child: SizedBox(
-              width: double.infinity,
-              height: 48,
-              child: FilledButton(
-                onPressed: _selected.isEmpty
-                    ? null
-                    : () => Navigator.of(context).pop(_selected),
-                child: Text('应用所选 (${_selected.length})'),
+                ),
               ),
-            ),
+              Flexible(
+                child: ListView(
+                  controller: scrollController,
+                  shrinkWrap: true,
+                  children: [
+                    // 封面放最上面：显示候选封面图片 + 勾选
+                    _coverTile(context),
+                    _fieldTile(
+                      context,
+                      MatchField.title,
+                      '标题',
+                      widget.currentTitle,
+                      c.title,
+                      enabled: c.title.isNotEmpty,
+                    ),
+                    _fieldTile(
+                      context,
+                      MatchField.artist,
+                      '歌手',
+                      widget.currentArtist,
+                      c.artist,
+                      enabled: c.artist.isNotEmpty,
+                    ),
+                    _fieldTile(
+                      context,
+                      MatchField.album,
+                      '专辑',
+                      widget.currentAlbum,
+                      c.album,
+                      enabled: c.album.isNotEmpty,
+                    ),
+                    _fieldTile(
+                      context,
+                      MatchField.year,
+                      '年份',
+                      widget.currentYear,
+                      c.date,
+                      enabled: c.date.isNotEmpty,
+                    ),
+                    _fieldTile(
+                      context,
+                      MatchField.trackNumber,
+                      '歌曲序号',
+                      widget.currentTrackNo.isEmpty
+                          ? '无'
+                          : widget.currentTrackNo,
+                      c.trackNumber.isEmpty ? '无序号' : '第 ${c.trackNumber} 首',
+                      enabled: c.trackNumber.isNotEmpty,
+                    ),
+                    _fieldTile(
+                      context,
+                      MatchField.discNumber,
+                      '光盘序号',
+                      widget.currentDiscNo.isEmpty ? '无' : widget.currentDiscNo,
+                      c.discNumber.isEmpty ? '无碟号' : '碟号 ${c.discNumber}',
+                      enabled: c.discNumber.isNotEmpty,
+                    ),
+                    if (LyricCompanionSettings.enabled.value)
+                      _fieldTile(
+                        context,
+                        MatchField.lyrics,
+                        '歌词',
+                        widget.currentLyrics.isEmpty
+                            ? '无'
+                            : '有（${widget.currentLyrics.length} 字符）',
+                        widget.matchedLyrics == null ||
+                                widget.matchedLyrics!.isEmpty
+                            ? '未获取到歌词'
+                            : '已匹配（${widget.matchedLyrics!.length} 字符）',
+                        enabled:
+                            widget.canMatchLyrics &&
+                            widget.matchedLyrics != null &&
+                            widget.matchedLyrics!.isNotEmpty,
+                        note: !widget.canMatchLyrics
+                            ? '未连接到增强插件（写入 NAS 不可用）'
+                            : widget.matchedLyrics == null ||
+                                  widget.matchedLyrics!.isEmpty
+                            ? '当前数据源未返回歌词'
+                            : null,
+                      ),
+                  ],
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+                child: SizedBox(
+                  width: double.infinity,
+                  height: 48,
+                  child: FilledButton(
+                    onPressed: _selected.isEmpty
+                        ? null
+                        : () => Navigator.of(context).pop(_selected),
+                    child: Text('应用所选 (${_selected.length})'),
+                  ),
+                ),
+              ),
+            ],
           ),
-        ],
-      ),
-    );
+        );
       },
     );
   }
@@ -2567,7 +2749,8 @@ class _MatchApplySheetState extends State<_MatchApplySheet> {
     String? note,
   }) {
     final theme = Theme.of(context);
-    final changed = note == null &&
+    final changed =
+        note == null &&
         oldValue.trim() != newValue.trim() &&
         newValue.isNotEmpty;
     return CheckboxListTile(
@@ -2583,8 +2766,9 @@ class _MatchApplySheetState extends State<_MatchApplySheet> {
               overflow: TextOverflow.ellipsis,
               style: theme.textTheme.bodySmall?.copyWith(
                 color: theme.colorScheme.onSurfaceVariant,
-                decoration:
-                    changed && _selected.contains(field) ? TextDecoration.lineThrough : null,
+                decoration: changed && _selected.contains(field)
+                    ? TextDecoration.lineThrough
+                    : null,
               ),
             ),
           ),
@@ -2654,16 +2838,14 @@ class _MatchApplySheetState extends State<_MatchApplySheet> {
 
     final oldCover = widget.currentCoverUrl;
     final newCover = c.picUrl;
-    final changed = hasCover &&
+    final changed =
+        hasCover &&
         (oldCover == null || oldCover.isEmpty || oldCover != newCover);
 
     return CheckboxListTile(
       value: selected,
       enabled: hasCover,
-      title: Text(
-        '封面',
-        style: theme.textTheme.titleSmall,
-      ),
+      title: Text('封面', style: theme.textTheme.titleSmall),
       // 删除 secondary 小图，改为 subtitle 内「原 → 新」两图对比
       subtitle: Row(
         children: [

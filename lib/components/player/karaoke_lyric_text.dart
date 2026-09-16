@@ -15,7 +15,7 @@ const Duration _kHighlightTransitionDuration = Duration(milliseconds: 200);
 /// 同一行内正向播放时只增不减，高亮边界为硬边（无渐变淡出）。
 /// 渲染使用缓存的 [TextPainter] + [CustomPainter]，每帧只重绘不重新布局，
 /// 与歌词详情页相同，避免逐帧重建 Text/ShaderMask 造成的卡顿。
-/// 没有单词时间戳时，会按字符把整行时长等分模拟逐字。
+/// 没有可靠字词时间戳时，直接高亮整行，不模拟逐字进度。
 /// 未显式传入 [baseColor] / [highlightColor] 时，分别使用歌词页配置的
 /// "普通歌词颜色"（卡拉OK基准色）与"逐字高亮颜色"。
 class KaraokeLyricText extends StatefulWidget {
@@ -122,8 +122,7 @@ class _KaraokeLyricTextState extends State<KaraokeLyricText>
     // 同步改 _controller 会触发监听它的 ValueListenableBuilder 同步
     // markNeedsBuild → “setState called during build” 级联崩溃。
     // 非安全期先登记，帧后统一执行。
-    if (SchedulerBinding.instance.schedulerPhase !=
-        SchedulerPhase.idle) {
+    if (SchedulerBinding.instance.schedulerPhase != SchedulerPhase.idle) {
       _scheduleTargetUpdate();
       return;
     }
@@ -151,7 +150,6 @@ class _KaraokeLyricTextState extends State<KaraokeLyricText>
     if (fullWidth <= 0) return;
     final progress = widget.position.value + widget.offset;
 
-    // 与详情页相同：优先用真实单词时间戳，否则按字符把整行时长等分模拟
     final words = _resolveLineWords() ?? const <LyricWord>[];
     _ensureWordWidths(words);
     final wordWidths = _wordWidths ?? const <double>[];
@@ -170,7 +168,7 @@ class _KaraokeLyricTextState extends State<KaraokeLyricText>
     }
 
     if (words.isEmpty) {
-      _animateTo(0.0);
+      _animateTo(progress >= line.start ? 1.0 : 0.0);
       _lastProgress = progress;
       return;
     }
@@ -368,7 +366,7 @@ class _KaraokeLyricTextState extends State<KaraokeLyricText>
               painter: KaraokeHighlightPainter(
                 painter: painter,
                 highlightColor: highlightColor,
-                fraction: hasKaraoke ? f : 0.0,
+                fraction: hasKaraoke ? f : 1.0,
               ),
             );
           },
@@ -401,38 +399,9 @@ class _KaraokeLyricTextState extends State<KaraokeLyricText>
     _wordWidthsStyle = style;
   }
 
-  Duration _effectiveEnd() {
-    final end = widget.lineEnd;
-    if (end != null && end > widget.line.start) return end;
-    return widget.line.start + const Duration(seconds: 3);
-  }
-
   List<LyricWord>? _resolveLineWords() {
     final words = widget.line.words;
-    if (words != null && words.isNotEmpty) return words;
-    final text = widget.line.text;
-    final start = widget.line.start;
-    final end = _effectiveEnd();
-    if (text.isEmpty || end <= start) return null;
-    final runes = text.runes.toList();
-    if (runes.isEmpty || runes.length > 5000) return null;
-    final totalMs = (end - start).inMilliseconds;
-    if (totalMs <= 0) return null;
-    final result = <LyricWord>[];
-    for (var i = 0; i < runes.length; i++) {
-      final ch = String.fromCharCode(runes[i]);
-      final wordStartMs =
-          start.inMilliseconds + ((totalMs * i) ~/ runes.length);
-      final wordEndMs = i == runes.length - 1
-          ? end.inMilliseconds
-          : start.inMilliseconds + ((totalMs * (i + 1)) ~/ runes.length);
-      final ws = Duration(milliseconds: wordStartMs);
-      final we = Duration(
-        milliseconds: wordEndMs <= wordStartMs ? wordStartMs + 1 : wordEndMs,
-      );
-      result.add(LyricWord(text: ch, start: ws, end: we));
-    }
-    return result;
+    return words != null && words.length >= 2 ? words : null;
   }
 }
 
