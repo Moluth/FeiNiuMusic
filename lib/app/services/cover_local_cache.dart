@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io' as io;
 
@@ -21,8 +22,13 @@ class CoverLocalCache {
   CoverLocalCache._();
 
   static const String kDirName = 'covers_v2';
+  static const Duration refreshInterval = Duration(days: 5);
 
   static final DefaultCacheManager _coverCache = DefaultCacheManager();
+  static final Map<String, Future<String?>> _refreshes =
+      <String, Future<String?>>{};
+  static final ValueNotifier<int> refreshVersion = ValueNotifier<int>(0);
+  static String? lastRefreshedPath;
 
   static String? _dirPath;
   static Future<String>? _applicationId;
@@ -60,13 +66,23 @@ class CoverLocalCache {
       updatedAt: updatedAt,
       size: size,
     );
-    if (await target.exists()) return target.path;
-
     final url = FeiNiuApiClient.instance.coverUrl(
       coverId,
       size: size,
       updatedAt: updatedAt,
     );
+    if (await target.exists()) {
+      try {
+        final modifiedAt = (await target.stat()).modified;
+        if (isCacheFresh(modifiedAt: modifiedAt, now: DateTime.now())) {
+          return target.path;
+        }
+      } catch (_) {}
+      // 过期封面仍立即返回，后台刷新。网络失败时保留旧文件，避免离线
+      // 状态退回占位图。
+      _refreshInBackground(url, target);
+      return target.path;
+    }
     // 目标尺寸未缓存时，先尝试复用同封面其它已缓存尺寸（App UI 的
     // CachedNetworkImage 与 _coverCache 是同一个 DefaultCacheManager 单例，
     // 播放页/列表页通常已把该封面以某个尺寸下载过）。直接磁盘拷贝，避免
@@ -78,7 +94,7 @@ class CoverLocalCache {
       final cacheObject = await _coverCache.getFileFromCache(url);
       if (cacheObject != null) {
         final f = io.File(cacheObject.file.path);
-        if (await f.exists()) return _copyToCoverCache(f, target);
+        if (await f.exists()) return await _copyToCoverCache(f, target);
       }
     } catch (error) {
       _debugLog('read cached cover failed: $error');
@@ -89,10 +105,43 @@ class CoverLocalCache {
         headers: FeiNiuApiClient.imageAuthHeaders(),
       );
       final f = io.File(cacheFile.path);
-      if (await f.exists()) return _copyToCoverCache(f, target);
+      if (await f.exists()) return await _copyToCoverCache(f, target);
     } catch (error) {
       _debugLog('download cover with cache manager failed: $error');
     }
+    return await _downloadDirect(url, target);
+  }
+
+  static bool isCacheFresh({
+    required DateTime modifiedAt,
+    required DateTime now,
+  }) {
+    final age = now.difference(modifiedAt);
+    return !age.isNegative && age < refreshInterval;
+  }
+
+  static void _refreshInBackground(String url, io.File target) {
+    if (_refreshes.containsKey(target.path)) return;
+    final future = _downloadDirect(url, target);
+    _refreshes[target.path] = future;
+    unawaited(
+      future
+          .then((path) {
+            if (path != null) {
+              lastRefreshedPath = path;
+              refreshVersion.value++;
+            }
+          })
+          .whenComplete(() {
+            if (identical(_refreshes[target.path], future)) {
+              _refreshes.remove(target.path);
+            }
+          }),
+    );
+  }
+
+  static Future<String?> _downloadDirect(String url, io.File target) async {
+    io.File? tempFile;
     try {
       final httpClient = io.HttpClient()
         ..badCertificateCallback = (_, _, _) => true;
@@ -110,7 +159,18 @@ class CoverLocalCache {
             <int>[],
             (prev, chunk) => prev..addAll(chunk),
           );
-          await target.writeAsBytes(bytes, flush: true);
+          tempFile = io.File(
+            '${target.path}.${DateTime.now().microsecondsSinceEpoch}.tmp',
+          );
+          await tempFile.writeAsBytes(bytes, flush: true);
+          try {
+            await tempFile.rename(target.path);
+          } on io.FileSystemException {
+            // 某些平台不允许 rename 覆盖已存在文件。保留旧封面比先删除再
+            // 替换更安全，避免并发读取看到空文件。
+            if (!await target.exists()) rethrow;
+            await tempFile.delete();
+          }
           return target.path;
         }
       } finally {
@@ -118,6 +178,11 @@ class CoverLocalCache {
       }
     } catch (error) {
       _debugLog('download cover fallback failed: $error');
+      try {
+        if (tempFile != null && await tempFile.exists()) {
+          await tempFile.delete();
+        }
+      } catch (_) {}
     }
     return null;
   }

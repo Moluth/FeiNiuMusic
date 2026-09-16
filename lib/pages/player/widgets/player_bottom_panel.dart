@@ -445,6 +445,7 @@ class BottomActions extends StatelessWidget {
       builder: (context) {
         final mode = player.playbackModeSignal.value;
         final text = player.sleepTimerDisplayTextSignal.value;
+        final song = player.currentSongSignal.value;
         final icon = switch (mode) {
           PlaybackMode.shuffle => Icons.shuffle,
           PlaybackMode.loop => Icons.repeat,
@@ -502,7 +503,7 @@ class BottomActions extends StatelessWidget {
                     );
                   }
                   actions.add(
-                    PlayerFavoriteButton(song: player.currentSongSignal.value),
+                    PlayerFavoriteButton(key: ValueKey(song?.id), song: song),
                   );
                   break;
                 case 'playlist':

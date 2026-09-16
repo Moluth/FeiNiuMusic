@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import '../../app/router/app_page_route.dart';
 import '../../app/services/feiniu/api_client.dart';
 import '../../app/services/feiniu/favorite_service.dart';
+import '../../app/services/feiniu/track_service.dart';
 import '../../app/services/feiniu/transcode_service.dart';
 import '../../app/services/player/player_engine.dart';
 import '../../app/services/player_service.dart';
@@ -52,14 +53,16 @@ class SongDetailSheet extends StatefulWidget {
 }
 
 class _SongDetailSheetState extends State<SongDetailSheet> {
-  final FeiNiuFavoriteService _favoriteService =
-      FeiNiuFavoriteService.instance;
+  final FeiNiuFavoriteService _favoriteService = FeiNiuFavoriteService.instance;
   bool _isFavorite = false;
   bool _loadingFavorite = true;
+  bool _refreshingMetadata = false;
+  late SongEntity _song;
 
   @override
   void initState() {
     super.initState();
+    _song = widget.song;
     // 模态底部面板打开：平板/TV/Windows 外壳据此隐藏迷你播放器
     // （外壳在 Navigator 外，sheet 盖不住它，会挡住 sheet 底部按钮）。
     // 延迟到帧后置位：本 initState 可能在 build 阶段（sheet 动画/通知重建
@@ -117,9 +120,43 @@ class _SongDetailSheetState extends State<SongDetailSheet> {
     }
   }
 
+  Future<void> _refreshMetadata() async {
+    if (_refreshingMetadata) return;
+    final onUpdated = widget.onUpdated;
+    final existingCueOffsetMs = _song.cueOffsetMs;
+    setState(() => _refreshingMetadata = true);
+    try {
+      final track = await FeiNiuApiClient.instance.getTrackMetadata(_song.id);
+      if (track == null) {
+        throw StateError('服务器未返回歌曲信息');
+      }
+      final updated = FeiNiuTrackService.instance
+          .trackToSongEntity(track)
+          .copyWith(cueOffsetMs: existingCueOffsetMs);
+      await PlayerService.instance.updateSongMetadata(updated);
+      onUpdated?.call(updated);
+      if (!mounted) return;
+      setState(() {
+        _song = updated;
+        _isFavorite = updated.isFavorite;
+      });
+      AppToast.show(context, '歌曲信息已刷新');
+    } catch (error) {
+      if (!mounted) return;
+      AppToast.show(context, '刷新歌曲信息失败', type: ToastType.error);
+    } finally {
+      if (mounted) {
+        setState(() => _refreshingMetadata = false);
+      }
+    }
+  }
+
   /// 点击解码 tag：弹出二选一解码器选择。选定后切换当前歌曲的解码引擎并关掉
   /// 面板（重载期间避免拖其他控件）。
-  Future<void> _showDecoderPicker(BuildContext context, EngineKind current) async {
+  Future<void> _showDecoderPicker(
+    BuildContext context,
+    EngineKind current,
+  ) async {
     final selected = await showModalBottomSheet<EngineKind>(
       context: context,
       backgroundColor: Colors.transparent,
@@ -140,9 +177,7 @@ class _SongDetailSheetState extends State<SongDetailSheet> {
       context: context,
       backgroundColor: Colors.transparent,
       isScrollControlled: true,
-      builder: (_) => _TranscodeFormatPickerSheet(
-        song: widget.song,
-      ),
+      builder: (_) => _TranscodeFormatPickerSheet(song: _song),
     );
     // null = 关闭面板（未选择）
     if (selected == null || !mounted) return;
@@ -165,7 +200,7 @@ class _SongDetailSheetState extends State<SongDetailSheet> {
     final secondaryTextColor = isDark
         ? Colors.white70
         : const Color.fromARGB(255, 100, 100, 100);
-    final song = widget.song;
+    final song = _song;
     final artist = song.artistDisplayName;
     final album = song.albumDisplayName;
     final primaryArtist = song.artistDisplayName;
@@ -279,9 +314,7 @@ class _SongDetailSheetState extends State<SongDetailSheet> {
                 final nav = Navigator.of(context);
                 nav.pop(); // 关闭详情 sheet
                 final updated = await nav.push<SongEntity>(
-                  buildAppPageRoute(
-                    (_) => SongEditPage(song: widget.song),
-                  ),
+                  buildAppPageRoute((_) => SongEditPage(song: _song)),
                 );
                 if (updated != null) {
                   // 激活回调刷新列表 + 更新当前播放/队列
@@ -290,8 +323,19 @@ class _SongDetailSheetState extends State<SongDetailSheet> {
                 }
               },
             ),
-            if (widget.extraActions != null)
-              ...widget.extraActions!,
+            if (widget.showPlayerControls)
+              AppListTile(
+                leading: const Icon(Icons.refresh_rounded),
+                title: '刷新歌曲信息',
+                trailing: _refreshingMetadata
+                    ? const SizedBox.square(
+                        dimension: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : null,
+                onTap: _refreshingMetadata ? null : _refreshMetadata,
+              ),
+            if (widget.extraActions != null) ...widget.extraActions!,
             if (widget.onOpenPlayerAppearanceSettings != null)
               AppListTile(
                 leading: const Icon(Icons.tune_rounded),
@@ -375,7 +419,8 @@ class _SongDetailSheetState extends State<SongDetailSheet> {
                               engine: engine,
                               // 桌面端只有 media_kit（FFmpeg）引擎，
                               // 禁止手动切到 just_audio（无实现）。
-                              onTap: Platform.isWindows ||
+                              onTap:
+                                  Platform.isWindows ||
                                       Platform.isMacOS ||
                                       Platform.isLinux
                                   ? null
@@ -399,8 +444,11 @@ class _SongDetailSheetState extends State<SongDetailSheet> {
 
   Widget _buildCover(ThemeData theme, SongEntity song) {
     if (song.coverId != null && song.coverId!.isNotEmpty) {
-      final coverUrl =
-          FeiNiuApiClient.instance.coverUrl(song.coverId!, size: FeiNiuApiClient.coverRequestSize, updatedAt: song.updatedAt);
+      final coverUrl = FeiNiuApiClient.instance.coverUrl(
+        song.coverId!,
+        size: FeiNiuApiClient.coverRequestSize,
+        updatedAt: song.updatedAt,
+      );
       return CachedNetworkImage(
         imageUrl: coverUrl,
         httpHeaders: FeiNiuApiClient.imageAuthHeaders(),
@@ -445,9 +493,10 @@ class _AppVolumeControl extends StatelessWidget {
     final colors = Theme.of(context).colorScheme;
     // 与下方 AppListTile 的标题对齐：同用 ListTileTheme 的 contentPadding，
     // leading（图标宽 24）与标题之间留 16（ListTile 默认 horizontalTitleGap）。
-    final tilePadding = ListTileTheme.of(context).contentPadding?.resolve(
-          Directionality.of(context),
-        ) ??
+    final tilePadding =
+        ListTileTheme.of(
+          context,
+        ).contentPadding?.resolve(Directionality.of(context)) ??
         const EdgeInsets.symmetric(horizontal: 16);
     return Padding(
       padding: EdgeInsets.only(
@@ -536,9 +585,10 @@ class _PlaybackSpeedControl extends StatelessWidget {
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
     // 与下方 AppListTile 的标题对齐：同用 ListTileTheme 的 contentPadding。
-    final tilePadding = ListTileTheme.of(context).contentPadding?.resolve(
-          Directionality.of(context),
-        ) ??
+    final tilePadding =
+        ListTileTheme.of(
+          context,
+        ).contentPadding?.resolve(Directionality.of(context)) ??
         const EdgeInsets.symmetric(horizontal: 16);
     return Padding(
       padding: EdgeInsets.only(

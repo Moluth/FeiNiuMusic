@@ -8,6 +8,8 @@ import 'dart:math';
 
 import 'package:just_audio/just_audio.dart';
 
+typedef AudioSourceEndpoint = ({Uri uri, Map<String, String> headers});
+
 /// 自研音频流缓存源 —— 扩展 [StreamAudioSource]
 ///
 /// 播放/预缓存时把远端音频流完整下载到本地文件，同时在下载过程中服务 just_audio
@@ -31,6 +33,10 @@ class StreamAudioCacheSource extends StreamAudioSource {
   /// 认证请求头（FeiNiuApiClient.imageAuthHeaders()）
   final Map<String, String> headers;
 
+  /// 延迟解析重定向后的实际流地址。创建播放队列时不发网络请求，只有音源
+  /// 真正开始播放或预缓存时才解析。
+  final Future<AudioSourceEndpoint> Function()? endpointResolver;
+
   /// 下载完成后的最终文件
   final File cacheFile;
 
@@ -45,6 +51,7 @@ class StreamAudioCacheSource extends StreamAudioSource {
   final Completer<void> _downloadCompleter = Completer<void>();
 
   Future<void>? _downloadFuture;
+  Future<AudioSourceEndpoint>? _endpointFuture;
   int _progress = 0;
   int? _sourceLength;
   String _contentType = 'audio/mpeg';
@@ -56,9 +63,10 @@ class StreamAudioCacheSource extends StreamAudioSource {
     required this.uri,
     required this.headers,
     required this.cacheFile,
+    this.endpointResolver,
     super.tag,
-  })  : partFile = File('${cacheFile.path}.part'),
-        mimeFile = File('${cacheFile.path}.mime');
+  }) : partFile = File('${cacheFile.path}.part'),
+       mimeFile = File('${cacheFile.path}.mime');
 
   bool get isDownloading => _downloading;
   bool get isComplete => _completed || cacheFile.existsSync();
@@ -117,8 +125,9 @@ class StreamAudioCacheSource extends StreamAudioSource {
     // → 偶发播放失败（需重试多次才能成功）。
     IOSink? sink;
     try {
-      final httpRequest = await client.getUrl(uri);
-      for (final entry in headers.entries) {
+      final endpoint = await _resolveEndpoint();
+      final httpRequest = await client.getUrl(endpoint.uri);
+      for (final entry in endpoint.headers.entries) {
         httpRequest.headers.set(entry.key, entry.value);
       }
       final response = await httpRequest.close();
@@ -127,7 +136,9 @@ class StreamAudioCacheSource extends StreamAudioSource {
       }
       partFile.createSync(recursive: true);
       sink = partFile.openWrite();
-      _sourceLength = response.contentLength == -1 ? null : response.contentLength;
+      _sourceLength = response.contentLength == -1
+          ? null
+          : response.contentLength;
       _contentType = response.headers.contentType.toString();
       await mimeFile.writeAsString(_contentType);
       _progress = 0;
@@ -140,16 +151,19 @@ class StreamAudioCacheSource extends StreamAudioSource {
         for (var cacheResponse in _inProgressResponses) {
           final end = cacheResponse.end;
           if (end != null && _progress >= end) {
-            final subEnd =
-                min(data.length, max(0, data.length - (_progress - end)));
+            final subEnd = min(
+              data.length,
+              max(0, data.length - (_progress - end)),
+            );
             cacheResponse.controller.add(data.sublist(0, subEnd));
             cacheResponse.controller.close();
           } else {
             cacheResponse.controller.add(data);
           }
         }
-        _inProgressResponses
-            .removeWhere((element) => element.controller.isClosed);
+        _inProgressResponses.removeWhere(
+          (element) => element.controller.isClosed,
+        );
 
         if (_requests.isEmpty) continue;
 
@@ -173,23 +187,25 @@ class StreamAudioCacheSource extends StreamAudioSource {
             responseStream = partFile.openRead(effectiveStart, effectiveEnd);
           } else {
             // 部分覆盖 → 已缓存部分 + 进行中下载流拼接
-            final cacheResponse =
-                _InProgressCacheResponse(end: effectiveEnd);
+            final cacheResponse = _InProgressCacheResponse(end: effectiveEnd);
             _inProgressResponses.add(cacheResponse);
             responseStream = _concatStreams([
               partFile.openRead(effectiveStart, _progress),
               cacheResponse.controller.stream,
             ]);
           }
-          request.complete(StreamAudioResponse(
-            rangeRequestsSupported: true,
-            sourceLength: request.start != null ? _sourceLength : null,
-            contentLength:
-                effectiveEnd != null ? effectiveEnd - effectiveStart : null,
-            offset: request.start,
-            contentType: _contentType,
-            stream: responseStream.asBroadcastStream(),
-          ));
+          request.complete(
+            StreamAudioResponse(
+              rangeRequestsSupported: true,
+              sourceLength: request.start != null ? _sourceLength : null,
+              contentLength: effectiveEnd != null
+                  ? effectiveEnd - effectiveStart
+                  : null,
+              offset: request.start,
+              contentType: _contentType,
+              stream: responseStream.asBroadcastStream(),
+            ),
+          );
         }
 
         for (final request in notReadyRequests) {
@@ -231,8 +247,9 @@ class StreamAudioCacheSource extends StreamAudioSource {
   ) async {
     final client = _createHttpClient();
     try {
-      final httpRequest = await client.getUrl(uri);
-      for (final entry in headers.entries) {
+      final endpoint = await _resolveEndpoint();
+      final httpRequest = await client.getUrl(endpoint.uri);
+      for (final entry in endpoint.headers.entries) {
         httpRequest.headers.set(entry.key, entry.value);
       }
       httpRequest.headers.set(
@@ -243,14 +260,16 @@ class StreamAudioCacheSource extends StreamAudioSource {
       if (response.statusCode != 206) {
         throw Exception('HTTP Status Error: ${response.statusCode}');
       }
-      request.complete(StreamAudioResponse(
-        rangeRequestsSupported: true,
-        sourceLength: _sourceLength,
-        contentLength: end != null ? end - start : null,
-        offset: start,
-        contentType: _contentType,
-        stream: response.asBroadcastStream(),
-      ));
+      request.complete(
+        StreamAudioResponse(
+          rangeRequestsSupported: true,
+          sourceLength: _sourceLength,
+          contentLength: end != null ? end - start : null,
+          offset: start,
+          contentType: _contentType,
+          stream: response.asBroadcastStream(),
+        ),
+      );
     } catch (e, st) {
       request.fail(e, st);
     } finally {
@@ -264,6 +283,12 @@ class StreamAudioCacheSource extends StreamAudioSource {
     // 不自动解压，保证缓存字节与线上字节一致，sourceLength/contentLength 与文件相符
     client.autoUncompress = false;
     return client;
+  }
+
+  Future<AudioSourceEndpoint> _resolveEndpoint() {
+    return _endpointFuture ??=
+        endpointResolver?.call() ??
+        Future<AudioSourceEndpoint>.value((uri: uri, headers: headers));
   }
 
   @override
@@ -286,11 +311,14 @@ class StreamAudioCacheSource extends StreamAudioSource {
     _ensureDownload();
     final resp = await req.future;
     // 保持一个监听者使广播流保持活跃；流出错时 fail 在途请求避免悬挂
-    resp.stream.listen((_) {}, onError: (Object e, StackTrace st) {
-      for (final r in _requests) {
-        r.fail(e, st);
-      }
-    });
+    resp.stream.listen(
+      (_) {},
+      onError: (Object e, StackTrace st) {
+        for (final r in _requests) {
+          r.fail(e, st);
+        }
+      },
+    );
     return resp;
   }
 

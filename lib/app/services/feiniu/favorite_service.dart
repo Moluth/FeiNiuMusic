@@ -1,5 +1,10 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 
+import '../audio/stream_cache_service.dart';
+import '../favorite_media_cache_service.dart';
+import 'account_store.dart';
 import 'api_client.dart';
 
 /// 飞牛收藏服务
@@ -16,6 +21,20 @@ class FeiNiuFavoriteService {
   );
   final Map<String, int> _revisions = <String, int>{};
   final Map<String, Future<bool>> _refreshes = <String, Future<bool>>{};
+
+  String get _favoriteOwner => StreamCacheService.favoriteRetentionOwnerFor(
+    AccountStore.instance.currentAccountId.value,
+  );
+
+  void _runCacheUpdate(Future<void> update) {
+    unawaited(
+      update.catchError((Object error) {
+        if (kDebugMode) {
+          debugPrint('[FavoriteService] cache owner update failed: $error');
+        }
+      }),
+    );
+  }
 
   bool favoriteState(String trackGuid, {bool fallback = false}) {
     return favoriteStates.value[trackGuid] ?? fallback;
@@ -74,10 +93,17 @@ class FeiNiuFavoriteService {
   /// 收藏页多选等场景使用；单首失败不中断其余。
   Future<int> favoriteAll(List<String> trackGuids) async {
     var failed = 0;
+    final favoriteOwner = _favoriteOwner;
     for (final id in trackGuids) {
       try {
         await _api.favoriteTrack(id);
         _publishFavoriteState(id, true);
+        _runCacheUpdate(
+          StreamCacheService.instance.setLongTermOwnerSongs(favoriteOwner, [
+            id,
+          ]),
+        );
+        unawaited(FavoriteMediaCacheService.instance.cacheFavoriteById(id));
       } catch (_) {
         failed++;
       }
@@ -95,10 +121,16 @@ class FeiNiuFavoriteService {
   /// 收藏页多选等场景使用；单首失败不中断其余。
   Future<int> unfavoriteAll(List<String> trackGuids) async {
     var failed = 0;
+    final favoriteOwner = _favoriteOwner;
     for (final id in trackGuids) {
       try {
         await _api.unfavoriteTrack(id);
         _publishFavoriteState(id, false);
+        _runCacheUpdate(
+          StreamCacheService.instance.removeLongTermOwnerSongs(favoriteOwner, [
+            id,
+          ]),
+        );
       } catch (_) {
         failed++;
       }
@@ -115,6 +147,7 @@ class FeiNiuFavoriteService {
   /// 乐观更新收藏状态：先通知 UI/媒体会话，再同步服务端；失败时回滚。
   Future<void> setFavorite(String trackGuid, bool value) async {
     if (pendingIds.value.contains(trackGuid)) return;
+    final favoriteOwner = _favoriteOwner;
     final previous = favoriteStates.value[trackGuid] ?? !value;
     _revisions[trackGuid] = (_revisions[trackGuid] ?? 0) + 1;
     _publishFavoriteState(trackGuid, value);
@@ -122,8 +155,21 @@ class FeiNiuFavoriteService {
     try {
       if (value) {
         await _api.favoriteTrack(trackGuid);
+        _runCacheUpdate(
+          StreamCacheService.instance.setLongTermOwnerSongs(favoriteOwner, [
+            trackGuid,
+          ]),
+        );
+        unawaited(
+          FavoriteMediaCacheService.instance.cacheFavoriteById(trackGuid),
+        );
       } else {
         await _api.unfavoriteTrack(trackGuid);
+        _runCacheUpdate(
+          StreamCacheService.instance.removeLongTermOwnerSongs(favoriteOwner, [
+            trackGuid,
+          ]),
+        );
       }
     } catch (_) {
       _publishFavoriteState(trackGuid, previous);

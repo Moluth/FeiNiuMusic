@@ -82,7 +82,7 @@ class _CacheSettingsPageState extends State<CacheSettingsPage>
   Future<int> _getLyricsCacheSize() async {
     try {
       final dir = await getApplicationSupportDirectory();
-      return _dirSize(Directory(p.join(dir.path, 'lyrics')));
+      return await _dirSize(Directory(p.join(dir.path, 'lyrics')));
     } catch (_) {
       return 0;
     }
@@ -219,6 +219,8 @@ class _CacheSettingsPageState extends State<CacheSettingsPage>
 
   String _formatGb(int mb) => '${(mb / 1024).toStringAsFixed(1)} GB';
 
+  String _formatCacheLimit(int mb) => mb == 0 ? '无限制' : _formatGb(mb);
+
   @override
   Widget build(BuildContext context) {
     final bottomPadding = AppPageScaffold.scrollableBottomPadding(
@@ -269,7 +271,7 @@ class _CacheSettingsPageState extends State<CacheSettingsPage>
                   subtitle: _loading.value
                       ? '计算中...'
                       : '已缓存: ${_formatSize(_streamCacheSize.value)} / '
-                            '上限 ${_formatGb(AppCacheSettings.cacheLimitMb.value)}',
+                            '上限 ${_formatCacheLimit(AppCacheSettings.cacheLimitMb.value)}',
                   trailing: const Icon(Icons.audiotrack_outlined),
                   onTap: _loading.value ? null : _clearStreamCache,
                 ),
@@ -280,17 +282,28 @@ class _CacheSettingsPageState extends State<CacheSettingsPage>
               children: [
                 ValueListenableBuilder<int>(
                   valueListenable: AppCacheSettings.cacheLimitMb,
-                  builder: (_, limitMb, _) => AppSettingSlider(
-                    title: '缓存上限',
-                    value: limitMb.toDouble(),
-                    min: 256,
-                    max: 5120,
-                    divisions: 19,
-                    valueText: _formatGb(limitMb),
-                    description: '超出上限时自动清理最旧的缓存。默认 1GB。',
-                    onChanged: (v) =>
-                        AppCacheSettings.setCacheLimitMb(v.round()),
+                  builder: (_, limitMb, _) => AppSettingSwitchTile(
+                    title: '缓存空间无限制',
+                    subtitle: '不自动清理已缓存的音乐',
+                    value: limitMb == 0,
+                    onChanged: AppCacheSettings.setUnlimited,
                   ),
+                ),
+                ValueListenableBuilder<int>(
+                  valueListenable: AppCacheSettings.cacheLimitMb,
+                  builder: (_, limitMb, _) => limitMb == 0
+                      ? const SizedBox.shrink()
+                      : AppSettingSlider(
+                          title: '缓存上限',
+                          value: limitMb.toDouble(),
+                          min: 256,
+                          max: 5120,
+                          divisions: 19,
+                          valueText: _formatGb(limitMb),
+                          description: '超出上限时自动清理最旧的缓存。',
+                          onChanged: (v) =>
+                              AppCacheSettings.setCacheLimitMb(v.round()),
+                        ),
                 ),
                 ValueListenableBuilder<bool>(
                   valueListenable: AppCacheSettings.precacheNextSong,

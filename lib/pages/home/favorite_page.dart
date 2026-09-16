@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:signals_flutter/signals_flutter.dart' hide computed;
 
 import '../../components/index.dart';
+import '../../app/services/audio/stream_cache_service.dart';
+import '../../app/services/feiniu/account_store.dart';
 import '../../app/services/feiniu/api_client.dart';
 import '../../app/services/feiniu/favorite_service.dart';
 import '../../app/services/feiniu/track_service.dart';
@@ -16,6 +18,17 @@ import '../../app/utils/primary_tab_refresh_mixin.dart';
 import '../../app/theme/app_styles.dart';
 import '../library/library_detail_pages.dart';
 import '../songs/song_detail_sheet.dart';
+
+@visibleForTesting
+String favoriteCountText({
+  required int loaded,
+  required int total,
+  required bool hasMore,
+}) {
+  if (total > loaded) return '已加载 $loaded / 共 $total 首';
+  if (!hasMore) return '共 $loaded 首';
+  return '已加载 $loaded 首';
+}
 
 class FavoritePage extends StatefulWidget {
   const FavoritePage({super.key});
@@ -42,8 +55,15 @@ class _FavoritePageState extends State<FavoritePage>
   void _handleSongsRemovedFromFavorite(List<String> removedIds) {
     if (removedIds.isEmpty) return;
     final idSet = removedIds.toSet();
-    _allSongs.value =
-        _allSongs.value.where((s) => !idSet.contains(s.id)).toList();
+    final previousCount = _allSongs.value.length;
+    _allSongs.value = _allSongs.value
+        .where((s) => !idSet.contains(s.id))
+        .toList();
+    final removedCount = previousCount - _allSongs.value.length;
+    if (_total > 0 && removedCount > 0) {
+      _total -= removedCount;
+      if (_total < 0) _total = 0;
+    }
     _applyFilter();
   }
 
@@ -87,7 +107,9 @@ class _FavoritePageState extends State<FavoritePage>
   }
 
   void _handleScroll() {
-    if (!_scrollController.hasClients || !_hasMore || _loadingMore.value) return;
+    if (!_scrollController.hasClients || !_hasMore || _loadingMore.value) {
+      return;
+    }
     final maxScroll = _scrollController.position.maxScrollExtent;
     final offset = _scrollController.offset;
     if (maxScroll - offset < 400) {
@@ -116,9 +138,11 @@ class _FavoritePageState extends State<FavoritePage>
       final songs = pageData.list
           .map((t) => _trackService.trackToSongEntity(t.toJson()))
           .toList();
-      _total = pageData.total;
+      if (pageData.total > 0) _total = pageData.total;
       _allSongs.value = [..._allSongs.value, ...songs];
-      _hasMore = _allSongs.value.length < _total;
+      _hasMore = _total > 0
+          ? _allSongs.value.length < _total
+          : songs.length >= _pageSize;
       _applyFilter();
       return songs.isNotEmpty;
     } catch (_) {
@@ -161,12 +185,16 @@ class _FavoritePageState extends State<FavoritePage>
     Future<List<SongEntity>> fetch() async {
       final pageData = await _api.getFavoriteList(
         page: 1,
-        size: _pageSize,
+        // 飞牛网页端同样使用 size=-1。该接口在 size=100 时部分版本会把
+        // total 返回为当前页数量，导致超过 100 首仍显示“共 100 首”。
+        size: -1,
         sort: '${_sortKey.value},${_ascending.value ? 'asc' : 'desc'}',
       );
       if (mounted) {
-        _total = pageData.total;
-        _hasMore = pageData.list.length < _total;
+        _total = pageData.total > pageData.list.length
+            ? pageData.total
+            : pageData.list.length;
+        _hasMore = false;
       }
       return pageData.list
           .map((t) => _trackService.trackToSongEntity(t.toJson()))
@@ -258,6 +286,9 @@ class _FavoritePageState extends State<FavoritePage>
     _player.playQueueFilledToLimit(
       songs,
       index,
+      cacheRetentionOwner: StreamCacheService.favoriteRetentionOwnerFor(
+        AccountStore.instance.currentAccountId.value,
+      ),
       fetchMore: _searchQuery.isNotEmpty ? null : _fetchFavoritePage,
     );
   }
@@ -279,7 +310,12 @@ class _FavoritePageState extends State<FavoritePage>
   /// 搜索激活时跳过填充（过滤子集无法分页续取）。
   Future<void> _playShuffleFilled() async {
     if (_searchQuery.isNotEmpty) {
-      _player.playShuffle(_songs.value);
+      _player.playShuffle(
+        _songs.value,
+        cacheRetentionOwner: StreamCacheService.favoriteRetentionOwnerFor(
+          AccountStore.instance.currentAccountId.value,
+        ),
+      );
       return;
     }
     final full = List<SongEntity>.from(_songs.value);
@@ -299,7 +335,12 @@ class _FavoritePageState extends State<FavoritePage>
       page++;
     }
     if (full.length > cap) full.removeRange(cap, full.length);
-    _player.playShuffle(full);
+    _player.playShuffle(
+      full,
+      cacheRetentionOwner: StreamCacheService.favoriteRetentionOwnerFor(
+        AccountStore.instance.currentAccountId.value,
+      ),
+    );
   }
 
   void _showSortSheet() {
@@ -347,10 +388,8 @@ class _FavoritePageState extends State<FavoritePage>
           if (artistGuid != null) {
             Navigator.of(context).push(
               MaterialPageRoute(
-                builder: (_) => ArtistDetailPage(
-                  artistName: name,
-                  artistGuid: artistGuid,
-                ),
+                builder: (_) =>
+                    ArtistDetailPage(artistName: name, artistGuid: artistGuid),
               ),
             );
           }
@@ -360,10 +399,8 @@ class _FavoritePageState extends State<FavoritePage>
           if (guid != null) {
             Navigator.of(context).push(
               MaterialPageRoute(
-                builder: (_) => AlbumDetailPage(
-                  albumName: name,
-                  albumGuid: guid,
-                ),
+                builder: (_) =>
+                    AlbumDetailPage(albumName: name, albumGuid: guid),
               ),
             );
           }
@@ -383,6 +420,7 @@ class _FavoritePageState extends State<FavoritePage>
                 final updated = List<SongEntity>.from(_allSongs.value)
                   ..removeWhere((s) => s.id == song.id);
                 _allSongs.value = updated;
+                if (_total > 0) _total--;
                 _applyFilter();
                 AppToast.show(context, '已取消收藏');
               } catch (e) {
@@ -426,14 +464,15 @@ class _FavoritePageState extends State<FavoritePage>
           leading: useBottomNavigation || AppLayoutSettings.tvMode.value
               ? null
               : (isMultiSelecting
-                  ? IconButton(
-                      icon: const Icon(Icons.close_rounded),
-                      onPressed: exitMultiSelect,
-                    )
-                  : IconButton(
-                      icon: const Icon(Icons.menu_rounded),
-                      onPressed: () => _scaffoldKey.currentState?.openDrawer(),
-                    )),
+                    ? IconButton(
+                        icon: const Icon(Icons.close_rounded),
+                        onPressed: exitMultiSelect,
+                      )
+                    : IconButton(
+                        icon: const Icon(Icons.menu_rounded),
+                        onPressed: () =>
+                            _scaffoldKey.currentState?.openDrawer(),
+                      )),
           actions: isMultiSelecting
               ? [
                   SelectAllButton(
@@ -454,7 +493,9 @@ class _FavoritePageState extends State<FavoritePage>
                   ),
                   SortActionButton(onTap: _showSortSheet),
                   IconButton(
-                    icon: Icon(_searchVisible ? Icons.search_off : Icons.search),
+                    icon: Icon(
+                      _searchVisible ? Icons.search_off : Icons.search,
+                    ),
                     onPressed: () {
                       setState(() {
                         _searchVisible = !_searchVisible;
@@ -536,41 +577,45 @@ class _FavoritePageState extends State<FavoritePage>
                   return Column(
                     children: [
                       Container(
-                          padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-                          child: Row(
-                            children: [
-                              InkWell(
-                                borderRadius: BorderRadius.circular(16),
-                                onTap: () => _playShuffleFilled(),
-                                child: Padding(
-                                  padding: const EdgeInsets.only(right: 8),
-                                  child: Icon(
-                                    Icons.shuffle_rounded,
-                                    size: 18,
-                                    color: scheme.primary,
-                                  ),
+                        padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+                        child: Row(
+                          children: [
+                            InkWell(
+                              borderRadius: BorderRadius.circular(16),
+                              onTap: () => _playShuffleFilled(),
+                              child: Padding(
+                                padding: const EdgeInsets.only(right: 8),
+                                child: Icon(
+                                  Icons.shuffle_rounded,
+                                  size: 18,
+                                  color: scheme.primary,
                                 ),
                               ),
-                              LoadMoreCountText(
-                                text: '共 ${_allSongs.value.length} 首',
-                                style: TextStyle(
-                                  color: scheme.onSurfaceVariant,
-                                  fontSize: 13,
-                                ),
-                                onTap: (_hasMore && _total > 0)
-                                    ? _showLoadMoreDialog
-                                    : null,
+                            ),
+                            LoadMoreCountText(
+                              text: favoriteCountText(
+                                loaded: _allSongs.value.length,
+                                total: _total,
+                                hasMore: _hasMore,
                               ),
-                            ],
-                          ),
+                              style: TextStyle(
+                                color: scheme.onSurfaceVariant,
+                                fontSize: 13,
+                              ),
+                              onTap: (_hasMore && _total > 0)
+                                  ? _showLoadMoreDialog
+                                  : null,
+                            ),
+                          ],
                         ),
-                        Expanded(
-                          child: RefreshIndicator(
-                            onRefresh: () => _load(forceRefresh: true),
-                            child: ListView.builder(
-                              controller: _scrollController,
-                              physics: const AlwaysScrollableScrollPhysics(),
-                              padding: const EdgeInsets.fromLTRB(16, 0, 16, 160),
+                      ),
+                      Expanded(
+                        child: RefreshIndicator(
+                          onRefresh: () => _load(forceRefresh: true),
+                          child: ListView.builder(
+                            controller: _scrollController,
+                            physics: const AlwaysScrollableScrollPhysics(),
+                            padding: const EdgeInsets.fromLTRB(16, 0, 16, 160),
                             itemCount:
                                 songs.length + (_loadingMore.value ? 1 : 0),
                             itemBuilder: (context, index) {
@@ -657,11 +702,11 @@ class _FavoritePageState extends State<FavoritePage>
                         ),
                       ),
                       if (isMultiSelecting)
-                          buildMultiSelectBar(
-                            includeFavorite: false,
-                            includeRemoveFavorite: true,
-                          ),
-                      ],
+                        buildMultiSelectBar(
+                          includeFavorite: false,
+                          includeRemoveFavorite: true,
+                        ),
+                    ],
                   );
                 },
               ),

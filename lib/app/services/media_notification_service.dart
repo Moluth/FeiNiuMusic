@@ -133,6 +133,7 @@ class _FeiNiuAudioHandler extends BaseAudioHandler
   static const String _actionFavorite = 'favorite';
   String? _currentLyricLine;
   String? _lastSongId;
+  String? _lastSongMetadataKey;
   bool _isFavorite = false;
   String? _lastQueueKey;
   List<String> _publishedQueueIds = const <String>[];
@@ -210,6 +211,7 @@ class _FeiNiuAudioHandler extends BaseAudioHandler
     FeiNiuFavoriteService.instance.favoriteStates.addListener(
       _onFavoriteStatesChanged,
     );
+    CoverLocalCache.refreshVersion.addListener(_onCoverCacheRefreshed);
     _currentLyricLine = LyricsService.instance.currentLineText.value;
     _loadPlatformCapabilities();
     _syncFromPlayer();
@@ -968,14 +970,27 @@ class _FeiNiuAudioHandler extends BaseAudioHandler
   void _syncFromPlayer() {
     final snap = player.snapshot.value;
     _requestNotificationPermissionIfNeeded(snap);
-    final songId = snap.song?.id;
+    final song = snap.song;
+    final songId = song?.id;
     final songChanged = songId != _lastSongId;
+    final songMetadataKey = song == null
+        ? null
+        : [
+            song.id,
+            song.title,
+            song.artist,
+            song.album ?? '',
+            song.coverId ?? '',
+            song.updatedAt ?? 0,
+            song.durationMs ?? 0,
+          ].join('|');
+    final metadataChanged = songMetadataKey != _lastSongMetadataKey;
+    _lastSongMetadataKey = songMetadataKey;
     final queueChanged = !identical(snap.queue, _lastSnapshotQueue);
     _lastSnapshotQueue = snap.queue;
     if (songId != _lastSongId) {
       _lastSongId = songId;
       _currentLyricLine = null;
-      final song = snap.song;
       if (song == null) {
         _isFavorite = false;
       } else {
@@ -989,9 +1004,9 @@ class _FeiNiuAudioHandler extends BaseAudioHandler
       _debugLog('song changed to ${snap.song?.title ?? 'none'}');
     }
 
-    if (songChanged) {
-      final song = snap.song;
+    if (songChanged || metadataChanged) {
       _cachedCoverUri = null;
+      _cachedCoverPath = null;
       if (song != null && song.coverId != null && song.coverId!.isNotEmpty) {
         _lastCoverId = song.coverId;
         if (io.Platform.isAndroid) {
@@ -1129,11 +1144,19 @@ class _FeiNiuAudioHandler extends BaseAudioHandler
   void _syncQueue(PlaybackSnapshot snap) {
     final sessionQueue = _queueForMediaSession(snap);
     final items = sessionQueue.map(_itemFromSong).toList();
-    // 去重键包含 artUri：封面解析完成后（远程 URL → content://）必须重新
-    // 发布队列，否则外部客户端（Android Auto / 妙播）读到的队列条目仍是
-    // 无法加载的远程 URL，卡片不显示封面。
+    // 去重键包含所有外部可见元数据：刷新歌曲信息或封面后必须重新发布，
+    // 否则 Android Auto / 系统媒体中心会继续显示旧队列条目。
     final queueKey = items
-        .map((i) => '${i.id}|${i.artUri?.toString() ?? ''}')
+        .map(
+          (i) => [
+            i.id,
+            i.title,
+            i.artist ?? '',
+            i.album ?? '',
+            i.duration?.inMilliseconds ?? 0,
+            i.artUri?.toString() ?? '',
+          ].join('|'),
+        )
         .join('|');
     if (queueKey == _lastQueueKey) return;
     _lastQueueKey = queueKey;
@@ -1213,6 +1236,18 @@ class _FeiNiuAudioHandler extends BaseAudioHandler
   void _onLyricLineChanged() {
     _currentLyricLine = LyricsService.instance.currentLineText.value;
     _syncMediaItem();
+  }
+
+  void _onCoverCacheRefreshed() {
+    final song = player.snapshot.value.song;
+    final refreshedPath = CoverLocalCache.lastRefreshedPath;
+    if (song == null ||
+        refreshedPath == null ||
+        refreshedPath != _cachedCoverPath) {
+      return;
+    }
+    _lastMediaItemKey = null;
+    unawaited(_publishWithLocalArt(song));
   }
 
   void _onNotificationSettingsChanged() {

@@ -14,6 +14,7 @@ import 'app/services/audio/stream_cache_service.dart';
 import 'app/services/backup/backup_service.dart';
 import 'app/services/debug_log_service.dart';
 import 'app/services/desktop_tray_service.dart';
+import 'app/services/favorite_media_cache_service.dart';
 import 'app/services/fn_auto_reconnect_service.dart';
 import 'app/services/island_lyric_service.dart';
 import 'app/services/macos_status_bar_service.dart';
@@ -187,9 +188,8 @@ Future<void> main() async {
   }
   // 初始化自动重连服务（监听网络变化 + API 失败）
   FnAutoReconnectService.instance.init();
-  // 迁移歌曲缓存到系统标准缓存目录后，启动时顺手清理旧版 app-support 目录中的
-  // 缓存（仅首次运行执行一次，见 StreamCacheService.cleanupLegacyDirOnce）。
-  unawaited(StreamCacheService.instance.cleanupLegacyDirOnce());
+  // 后台维护音频缓存：迁移旧目录、清理中断文件与超过保留期的临时歌曲。
+  unawaited(StreamCacheService.instance.performMaintenance());
   // 液体玻璃：预热 shader（非阻塞异步磁盘 I/O，0.30.x 保证 runApp 前零 GPU
   // 调用，首帧不卡顿）。开关只决定渲染哪个组件分支，此处始终初始化。
   await LiquidGlassWidgets.initialize();
@@ -227,6 +227,8 @@ Future<void> main() async {
   // 后台连接预热：静默验证缓存连接的可用性，不可用时自动回退完整探测
   // 不阻塞首页渲染，首页首次请求走已有连接，预热找到更好的 URL 会无缝切换。
   _warmupConnection();
+  // 收藏歌曲离线缓存是低优先级任务，且会在登录账号变化后重新调度。
+  FavoriteMediaCacheService.instance.start();
   // 自动备份属于低优先级全量磁盘/网络任务，延后到启动与连接预热稳定后执行，
   // 避免与首屏、账号恢复、更新检查同时争用 CPU 和网络。
   Timer(const Duration(seconds: 30), () {

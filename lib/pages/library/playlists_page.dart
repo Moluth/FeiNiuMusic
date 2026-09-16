@@ -11,6 +11,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:signals_flutter/signals_flutter.dart' hide computed;
 
 import '../../app/router/app_page_route.dart';
+import '../../app/services/audio/stream_cache_service.dart';
+import '../../app/services/feiniu/account_store.dart';
 import '../../app/services/feiniu/api_client.dart';
 import '../../app/services/feiniu/api_models.dart';
 import '../../app/services/feiniu/favorite_service.dart';
@@ -111,7 +113,11 @@ class _PlaylistsPageState extends State<PlaylistsPage>
     final memoryCacheSize = coverMemoryCacheDimensionOf(context, 160);
     for (final p in items.take(count)) {
       if (p.coverId != null && p.coverId!.isNotEmpty) {
-        final url = api.coverUrl(p.coverId!, size: FeiNiuApiClient.coverRequestSize, updatedAt: p.updatedAt);
+        final url = api.coverUrl(
+          p.coverId!,
+          size: FeiNiuApiClient.coverRequestSize,
+          updatedAt: p.updatedAt,
+        );
         unawaited(
           precacheImage(
             ResizeImage.resizeIfNeeded(
@@ -146,8 +152,9 @@ class _PlaylistsPageState extends State<PlaylistsPage>
   }
 
   void _handleScroll() {
-    if (!_scrollController.hasClients || !_hasMore || _loadingMore.value)
+    if (!_scrollController.hasClients || !_hasMore || _loadingMore.value) {
       return;
+    }
     final maxScroll = _scrollController.position.maxScrollExtent;
     final offset = _scrollController.offset;
     if (maxScroll - offset < 400) {
@@ -560,49 +567,49 @@ class _PlaylistsPageState extends State<PlaylistsPage>
                     child: SizedBox(
                       width: double.infinity,
                       child: SegmentedButton<int>(
-                    // TV 大屏给更多列选项（4/5/6），手机/平板保持 2/3/4。
-                    segments: AppLayoutSettings.tvMode.value
-                        ? const [
-                            ButtonSegment(
-                              value: 4,
-                              label: Text('四列'),
-                              icon: Icon(Icons.grid_view_rounded),
-                            ),
-                            ButtonSegment(
-                              value: 5,
-                              label: Text('五列'),
-                              icon: Icon(Icons.grid_view_rounded),
-                            ),
-                            ButtonSegment(
-                              value: 6,
-                              label: Text('六列'),
-                              icon: Icon(Icons.grid_view_rounded),
-                            ),
-                          ]
-                        : const [
-                            ButtonSegment(
-                              value: 2,
-                              label: Text('二列'),
-                              icon: Icon(Icons.grid_view_rounded),
-                            ),
-                            ButtonSegment(
-                              value: 3,
-                              label: Text('三列'),
-                              icon: Icon(Icons.grid_view_rounded),
-                            ),
-                            ButtonSegment(
-                              value: 4,
-                              label: Text('四列'),
-                              icon: Icon(Icons.grid_view_rounded),
-                            ),
-                          ],
-                    selected: {_gridColumns.value},
-                    onSelectionChanged: (selection) {
-                      final v = selection.first;
-                      _gridColumns.value = v;
-                      _savePrefs();
-                    },
-                    showSelectedIcon: false,
+                        // TV 大屏给更多列选项（4/5/6），手机/平板保持 2/3/4。
+                        segments: AppLayoutSettings.tvMode.value
+                            ? const [
+                                ButtonSegment(
+                                  value: 4,
+                                  label: Text('四列'),
+                                  icon: Icon(Icons.grid_view_rounded),
+                                ),
+                                ButtonSegment(
+                                  value: 5,
+                                  label: Text('五列'),
+                                  icon: Icon(Icons.grid_view_rounded),
+                                ),
+                                ButtonSegment(
+                                  value: 6,
+                                  label: Text('六列'),
+                                  icon: Icon(Icons.grid_view_rounded),
+                                ),
+                              ]
+                            : const [
+                                ButtonSegment(
+                                  value: 2,
+                                  label: Text('二列'),
+                                  icon: Icon(Icons.grid_view_rounded),
+                                ),
+                                ButtonSegment(
+                                  value: 3,
+                                  label: Text('三列'),
+                                  icon: Icon(Icons.grid_view_rounded),
+                                ),
+                                ButtonSegment(
+                                  value: 4,
+                                  label: Text('四列'),
+                                  icon: Icon(Icons.grid_view_rounded),
+                                ),
+                              ],
+                        selected: {_gridColumns.value},
+                        onSelectionChanged: (selection) {
+                          final v = selection.first;
+                          _gridColumns.value = v;
+                          _savePrefs();
+                        },
+                        showSelectedIcon: false,
                       ),
                     ),
                   ),
@@ -956,7 +963,6 @@ class PlaylistDetailPage extends StatefulWidget {
 
 class _PlaylistDetailPageState extends State<PlaylistDetailPage>
     with SignalsMixin {
-  final FeiNiuApiClient _api = FeiNiuApiClient.instance;
   final FeiNiuPlaylistService _service = FeiNiuPlaylistService.instance;
   final FeiNiuTrackService _trackService = FeiNiuTrackService.instance;
 
@@ -991,8 +997,9 @@ class _PlaylistDetailPageState extends State<PlaylistDetailPage>
   }
 
   void _handleScroll() {
-    if (!_scrollController.hasClients || !_hasMore || _loadingMore.value)
+    if (!_scrollController.hasClients || !_hasMore || _loadingMore.value) {
       return;
+    }
     final maxScroll = _scrollController.position.maxScrollExtent;
     final offset = _scrollController.offset;
     if (maxScroll - offset < 400) {
@@ -1012,8 +1019,8 @@ class _PlaylistDetailPageState extends State<PlaylistDetailPage>
   Future<bool> _fetchAndAppendNextPage() async {
     _currentPage++;
     try {
-      final pageData = await _api.getPlaylistTracks(
-        playlistGUID: widget.playlistId,
+      final pageData = await _service.getPlaylistTrackPage(
+        widget.playlistId,
         page: _currentPage,
         size: _pageSize,
       );
@@ -1025,6 +1032,13 @@ class _PlaylistDetailPageState extends State<PlaylistDetailPage>
       _songs.value = [..._songs.value, ...songs];
       _originalSongs.value = [..._originalSongs.value, ...songs];
       _hasMore = _songs.value.length < _total;
+      if (!_hasMore) {
+        await _service.syncPlaylistOwner(
+          widget.playlistId,
+          _originalSongs.value.map((song) => song.id),
+          replace: true,
+        );
+      }
       return songs.isNotEmpty;
     } catch (_) {
       _currentPage--;
@@ -1061,8 +1075,8 @@ class _PlaylistDetailPageState extends State<PlaylistDetailPage>
 
   /// 拉取「已加载页之后」的第 [page] 页歌单歌曲（供填充播放使用）。
   Future<List<SongEntity>> _fetchPlaylistPage(int page) async {
-    final pageData = await _api.getPlaylistTracks(
-      playlistGUID: widget.playlistId,
+    final pageData = await _service.getPlaylistTrackPage(
+      widget.playlistId,
       page: _currentPage + page,
       size: _pageSize,
     );
@@ -1082,14 +1096,21 @@ class _PlaylistDetailPageState extends State<PlaylistDetailPage>
       full.addAll(songs);
     }
     if (full.length > cap) full.removeRange(cap, full.length);
+    if (_total > 0 && full.length >= _total) {
+      await _service.syncPlaylistOwner(
+        widget.playlistId,
+        full.map((song) => song.id),
+        replace: true,
+      );
+    }
     return full;
   }
 
   Future<void> _load() async {
     _loading.value = true;
     try {
-      final pageData = await _api.getPlaylistTracks(
-        playlistGUID: widget.playlistId,
+      final pageData = await _service.getPlaylistTrackPage(
+        widget.playlistId,
         page: 1,
         size: _pageSize,
       );
@@ -1270,7 +1291,18 @@ class _PlaylistDetailPageState extends State<PlaylistDetailPage>
                           if (!_isSequentialPlay.value) {
                             queue.shuffle();
                           }
-                          await player.playQueue(queue, 0);
+                          await player.playQueue(
+                            queue,
+                            0,
+                            cacheRetentionOwner:
+                                StreamCacheService.playlistRetentionOwner(
+                                  widget.playlistId,
+                                  accountId: AccountStore
+                                      .instance
+                                      .currentAccountId
+                                      .value,
+                                ),
+                          );
                         },
                         onConfigurePlay: () {},
                         onTogglePlayMode: _togglePlayMode,
@@ -1520,6 +1552,10 @@ class _PlaylistDetailPageState extends State<PlaylistDetailPage>
             await player.playQueueFilledToLimit(
               _songs.value,
               index,
+              cacheRetentionOwner: StreamCacheService.playlistRetentionOwner(
+                widget.playlistId,
+                accountId: AccountStore.instance.currentAccountId.value,
+              ),
               fetchMore: _fetchPlaylistPage,
             );
           },
@@ -1762,8 +1798,10 @@ class _SlideRevealActionState extends State<_SlideRevealAction>
                             SizedBox(height: 2),
                             Text(
                               '删除',
-                              style:
-                                  TextStyle(color: Colors.white, fontSize: 12),
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 12,
+                              ),
                             ),
                           ],
                         ),

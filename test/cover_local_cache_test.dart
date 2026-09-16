@@ -27,4 +27,30 @@ void main() {
       expect(uri, isNull);
     });
   });
+
+  group('CoverLocalCache freshness', () {
+    test('does not refresh before five days', () {
+      final now = DateTime(2026, 9, 14, 12);
+
+      expect(
+        CoverLocalCache.isCacheFresh(
+          modifiedAt: now.subtract(const Duration(days: 4, hours: 23)),
+          now: now,
+        ),
+        isTrue,
+      );
+    });
+
+    test('refreshes at the five day boundary', () {
+      final now = DateTime(2026, 9, 14, 12);
+
+      expect(
+        CoverLocalCache.isCacheFresh(
+          modifiedAt: now.subtract(const Duration(days: 5)),
+          now: now,
+        ),
+        isFalse,
+      );
+    });
+  });
 }

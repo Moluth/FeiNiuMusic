@@ -9,12 +9,18 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:media_kit/media_kit.dart' as mk;
+import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:signals/signals.dart';
 
+import '../navigator_key.dart';
+import '../state/settings_state.dart';
+import '../state/song_state.dart';
+import '../../components/feedback/app_toast.dart';
 import 'db/dao/song_dao.dart';
 import 'audio/stream_cache_service.dart';
 import 'cast/dlna_cast_service.dart';
+import 'cover_local_cache.dart';
 import 'feiniu/api_client.dart';
 import 'feiniu/api_models.dart';
 import 'feiniu/auth_service.dart';
@@ -28,10 +34,8 @@ import 'player/playback_router.dart';
 import 'player/player_engine.dart';
 import 'stats_service.dart';
 import 'listening_recorder_service.dart';
+import 'lyrics/lyrics_repository.dart';
 import 'volume_schedule_service.dart';
-import '../state/settings_state.dart';
-import '../state/song_state.dart';
-import '../../components/feedback/app_toast.dart';
 export '../state/player_state.dart';
 import '../state/player_state.dart';
 
@@ -221,6 +225,7 @@ class PlayerService with WidgetsBindingObserver {
   Timer? _snapshotTimer;
   int _prefetchTriggeredIndex = -1;
   bool _recoveringCurrentSource = false;
+  String? _pendingSelectionSongId;
 
   /// roam 追加请求串行化：>0 表示有请求进行中或待处理
   int _roamAppendQueuedCount = 0;
@@ -229,7 +234,8 @@ class PlayerService with WidgetsBindingObserver {
   /// 与 _roamAppendQueuedCount 不同，调用方可 await 它等待追加完成
   /// （next 在队尾需等追加完成再前进，避免物理源未填满时 seekToNext
   /// 越过队尾被 LoopMode.all 回卷到队首）。
-  Future<void>? _roamAppendInFlight;
+  Future<bool>? _roamAppendInFlight;
+  Future<void> _roamMetadataPrecache = Future<void>.value();
 
   /// 切换到随机模式但当前队列还不是漫游队列（roamId 为空）时置 true，
   /// 表示当前歌曲播完/切到队尾后应启动漫游（roam-start 拉新链），
@@ -247,6 +253,9 @@ class PlayerService with WidgetsBindingObserver {
   /// 链式：`_loadQueueLock` 持有当前在途 Future，后续调用 await 它再执行，
   /// 天然保证同一时刻只有一个加载在途。
   Future<void> _loadQueueLock = Future.value();
+  Future<void> _queueAppendChain = Future<void>.value();
+  Future<void>? _queueAppendInFlight;
+  bool _handlingEngineCompletion = false;
 
   /// 本次 `_activateLogicalIndex` 期望加载的逻辑索引。
   /// `currentIndexStream` 监听器用它过滤 setAudioSources 期间的过渡广播
@@ -371,8 +380,9 @@ class PlayerService with WidgetsBindingObserver {
         NetworkConnectionService.instance.isWifiConnected;
     if (active == _wifiDirectPolicyActive) return;
     _wifiDirectPolicyActive = active;
-    if (queue.value.isEmpty || currentIndex.value < 0 || isCasting.value)
+    if (queue.value.isEmpty || currentIndex.value < 0 || isCasting.value) {
       return;
+    }
     _networkRouteRefreshTimer?.cancel();
     _networkRouteRefreshTimer = Timer(const Duration(milliseconds: 500), () {
       unawaited(_refreshNetworkTranscodeRoute());
@@ -633,6 +643,7 @@ class PlayerService with WidgetsBindingObserver {
       isPlaying.value = state.playing;
       // 加载中（loading/buffering）视为加载态，驱动播放按钮转圈
       final loading =
+          _pendingSelectionSongId != null ||
           state.processingState == EngineProcessingState.loading ||
           state.processingState == EngineProcessingState.buffering;
       if (loading != isLoading.value) {
@@ -645,8 +656,8 @@ class PlayerService with WidgetsBindingObserver {
       // 顺序模式/漫游：当前曲目播完且队列没有可播的下一首时自动追加。
       // 引擎 run 不自动回卷，completed 统一由 _handleEngineCompleted 驱动前进。
       if (state.processingState == EngineProcessingState.completed &&
-          playbackMode.value != PlaybackMode.single &&
-          _roamAppendQueuedCount <= 0) {
+          _pendingSelectionSongId == null &&
+          playbackMode.value != PlaybackMode.single) {
         unawaited(_handleEngineCompleted(engine));
       }
       // 无损大文件（media_kit 直连原始流）对网络要求高：缓冲超时提示网络缓慢。
@@ -675,6 +686,11 @@ class PlayerService with WidgetsBindingObserver {
       // 这些 0/过渡广播都是噪音，放行会把 UI 打回 run 起点（「第 N 首重启
       // 变第 1 首」）。恢复完成后 _restoringState 置 false，真实切歌正常驱动。
       if (_restoringState) return;
+      // 用户正在用新队列替换当前播放时，stop 旧引擎可能继续广播旧索引。
+      // 新目标尚未进入加载锁前没有 _pendingLoadLogicalIndex，直接忽略。
+      if (_pendingSelectionSongId != null && _pendingLoadLogicalIndex == null) {
+        return;
+      }
       // setAudioSources 替换队列期间，just_audio 会广播过渡 currentIndex
       // （_broadcastSequence 保留旧 currentIndex，只有 sequence 变化）。
       // 这些过渡广播会触发 _activateSong 把 UI 切到旧歌——「点歌跳一遍」。
@@ -697,22 +713,27 @@ class PlayerService with WidgetsBindingObserver {
           logicalIdx >= list.length - 2) {
         unawaited(_autoExtendQueue());
       }
-      // 漫游/随机模式：切到新歌时，若它是队列最后一首（没有可播的下一首了），
-      // 就请求追加一首到队尾。漫游走 roam-next；本地随机（playShuffle）走
-      // queueExtender；刚切换的「待启动漫游」在此启动。
+      // 漫游模式始终维持最多 8 首待播歌曲；本地随机仍只在队尾补链。
       if (playbackMode.value == PlaybackMode.shuffle &&
           logicalIdx >= 0 &&
           list.isNotEmpty &&
-          logicalIdx == list.length - 1 &&
           _roamAppendQueuedCount <= 0) {
         if (_roamStartPending) {
-          _roamStartPending = false;
-          unawaited(_startRoamFromPending());
+          if (logicalIdx == list.length - 1) {
+            _roamStartPending = false;
+            unawaited(_startRoamFromPending());
+          }
         } else {
           final id = roamId;
           if (id != null && id.isNotEmpty) {
-            unawaited(_extendRoamQueue());
-          } else {
+            if (shouldPrefillRoamQueue(
+              queueLength: list.length,
+              currentIndex: logicalIdx,
+              queueCap: _queueCap,
+            )) {
+              unawaited(_extendRoamQueue());
+            }
+          } else if (logicalIdx == list.length - 1) {
             unawaited(_autoExtendQueue());
           }
         }
@@ -725,7 +746,25 @@ class PlayerService with WidgetsBindingObserver {
   /// 引擎 `completed` 统一处理：驱动跨引擎前进 / 队尾回卷 / 漫游补链。
   /// 这是双引擎架构下循环语义的核心——run 不自动回卷，逻辑层驱动一切。
   Future<void> _handleEngineCompleted(PlayerEngine engine) async {
+    if (_handlingEngineCompletion) return;
+    _handlingEngineCompletion = true;
+    try {
+      await _handleEngineCompletedOnce(engine);
+    } finally {
+      _handlingEngineCompletion = false;
+    }
+  }
+
+  Future<void> _handleEngineCompletedOnce(PlayerEngine engine) async {
     if (!identical(engine, _activeEngine)) return;
+    final roamAppend = _roamAppendInFlight;
+    if (roamAppend != null) await roamAppend;
+    final queueAppend = _queueAppendInFlight;
+    if (queueAppend != null) await queueAppend;
+    if (!identical(engine, _activeEngine) ||
+        engine.processingState != EngineProcessingState.completed) {
+      return;
+    }
     if (playbackMode.value == PlaybackMode.single) return; // 引擎自行重复
     _recorder.markCompleted(); // 完整播完：报告埋点标记 completed=1
     // 当前歌播完：若它是转码 HLS，后台把全部分片拼接下载成完整文件，
@@ -897,7 +936,7 @@ class PlayerService with WidgetsBindingObserver {
   ///   ExoPlayer 播，且每首独立成 run）；
   /// - 其余 → `routeForSong` 默认路由，flag=false。
   Future<({List<EngineKind> kinds, List<bool> transcodeFlags})>
-  _computeEngineKinds(List<SongEntity> songs) async {
+  _computeEngineKinds(List<SongEntity> songs, {String? prioritySongId}) async {
     final results = await Future.wait(
       songs.map((s) async {
         if (_mediaKitEscalateSongIds.contains(s.id)) {
@@ -911,24 +950,42 @@ class PlayerService with WidgetsBindingObserver {
           // _debugLog('engineKind ${s.title} -> ${forced.name} (manual)');
           return (kind: forced, transcode: false);
         }
+        if (prioritySongId == null || s.id == prioritySongId) {
+          final transcodeCodec = FeiNiuTranscodeService.instance
+              .effectiveCodecFor(s.id);
+          final cachedTranscode = await StreamCacheService.instance
+              .transcodeCompleteFileFor(s.id, transcodeCodec);
+          if (cachedTranscode != null) {
+            return (kind: EngineKind.justAudio, transcode: true);
+          }
+          final cachedOriginal = await StreamCacheService.instance
+              .completeFileFor(s.id, song: s, allowMetadataLookup: false);
+          if (cachedOriginal != null) {
+            final extension = p
+                .extension(cachedOriginal.path)
+                .replaceFirst('.', '');
+            return (
+              kind: routeForFormat(extension, codec: s.codec),
+              transcode: false,
+            );
+          }
+        }
         // 转码歌强制 just_audio（HLS 只能 ExoPlayer 播）。转码失败标记后
         // 回落到下方 routeForSong（DSF→mediaKit 直连，FLAC→justAudio 直连）。
         // 用户在面板选「直连」的歌（_forceDirectSongIds）跳过转码分支。
         if (!_forceDirectSongIds.contains(s.id) &&
             !_transcodeFailedSongIds.contains(s.id) &&
-            await FeiNiuTranscodeService.instance.shouldTranscode(s)) {
+            await FeiNiuTranscodeService.instance.shouldTranscode(
+              s,
+              allowMetadataLookup:
+                  prioritySongId == null || s.id == prioritySongId,
+            )) {
           _debugLog('engineKind ${s.title} -> justAudio (transcode)');
           return (kind: EngineKind.justAudio, transcode: true);
         }
-        final kind = await routeForSong(s);
-        // 只打印走 media_kit 的异常路由（正常 just_audio 不刷屏），用于
-        // 确诊「为什么普通歌进了 media_kit」。
-        if (kDebugMode && kind == EngineKind.mediaKit) {
-          final fmt = FeiNiuTranscodeService.instance.resolvedFormatForSync(s);
-          // debugPrint(
-          //   '[PlayerService] engineKind ${s.title} fmt=$fmt -> mediaKit',
-          // );
-        }
+        // 队列路由只使用列表数据与本地缓存，不为尚未播放的歌曲逐首请求
+        // /track/metadata。真正播放到格式未知的歌曲时，源解析仍有完整兜底。
+        final kind = routeForFormat(s.format, codec: s.codec);
         return (kind: kind, transcode: false);
       }),
     );
@@ -990,13 +1047,52 @@ class PlayerService with WidgetsBindingObserver {
   Future<void> _activateLogicalIndex(
     int logicalIndex, {
     Duration? initialPosition,
+    bool preload = false,
   }) async {
     final prev = _loadQueueLock;
     final completer = Completer<void>();
     _loadQueueLock = completer.future;
     try {
       await prev;
-      await _activateLogicalIndexLocked(logicalIndex, initialPosition);
+      await _activateLogicalIndexLocked(
+        logicalIndex,
+        initialPosition,
+        preload: preload,
+      );
+    } finally {
+      if (!completer.isCompleted) completer.complete();
+    }
+  }
+
+  Future<bool> _insertItemsForQueue({
+    required PlayerEngine engine,
+    required int generation,
+    required List<SongEntity> expectedQueue,
+    required int index,
+    required List<EngineItem> items,
+    int? pendingLogicalIndex,
+  }) async {
+    final previous = _loadQueueLock;
+    final completer = Completer<void>();
+    _loadQueueLock = completer.future;
+    try {
+      await previous;
+      if (generation != _queueGeneration ||
+          !identical(engine, _activeEngine) ||
+          !identical(queue.value, expectedQueue)) {
+        return false;
+      }
+      if (pendingLogicalIndex != null) {
+        _pendingLoadLogicalIndex = pendingLogicalIndex;
+      }
+      try {
+        await engine.insertItems(index, items);
+      } finally {
+        if (_pendingLoadLogicalIndex == pendingLogicalIndex) {
+          _pendingLoadLogicalIndex = null;
+        }
+      }
+      return true;
     } finally {
       if (!completer.isCompleted) completer.complete();
     }
@@ -1014,8 +1110,9 @@ class PlayerService with WidgetsBindingObserver {
   /// 去重），重算对已解析的歌零网络开销。
   Future<void> _activateLogicalIndexLocked(
     int logicalIndex,
-    Duration? initialPosition,
-  ) async {
+    Duration? initialPosition, {
+    bool preload = false,
+  }) async {
     if (kDebugMode) {
       debugPrint(
         '[PlayerService] activateLocked idx=$logicalIndex '
@@ -1055,7 +1152,10 @@ class PlayerService with WidgetsBindingObserver {
     // 在 pause 旧引擎之前设置，否则「song changed to 旧歌」会先于加载发生。
     _pendingLoadLogicalIndex = logicalIndex;
     // 引擎路由始终在锁内用当前队列重算（不依赖锁外的赋值/长度缓存）。
-    final computed = await _computeEngineKinds(list);
+    final computed = await _computeEngineKinds(
+      list,
+      prioritySongId: list[logicalIndex].id,
+    );
     _engineKinds = computed.kinds;
     _engineTranscodeFlags = computed.transcodeFlags;
     final bounds = _runBounds(logicalIndex);
@@ -1119,7 +1219,7 @@ class PlayerService with WidgetsBindingObserver {
             items: items,
             index: localIndex,
             initialPosition: initialPosition,
-            preload: false,
+            preload: preload,
           )
           .timeout(MediaKitEngine.openTimeout + const Duration(seconds: 2));
     } catch (e) {
@@ -1178,7 +1278,9 @@ class PlayerService with WidgetsBindingObserver {
         await _mediaForSong(song, waitForLocal: waitForLocal),
       );
     }
-    return JustAudioItem(await _sourceForSong(song));
+    return JustAudioItem(
+      await _sourceForSong(song, allowNetworkResolution: waitForLocal),
+    );
   }
 
   /// media_kit 播放源。
@@ -1215,6 +1317,7 @@ class PlayerService with WidgetsBindingObserver {
         final existing = await StreamCacheService.instance.completeFileFor(
           song.id,
           song: song,
+          allowMetadataLookup: waitForLocal,
         );
         if (existing != null) {
           return mk.Media(existing.path);
@@ -1228,6 +1331,12 @@ class PlayerService with WidgetsBindingObserver {
     //    预解析最终 URL（同源保留 Cookie / 跨主机剥离），避免 mpv 跟随重定向
     //    时认证头行为不可控导致 401 转圈。
     final api = FeiNiuApiClient.instance;
+    if (!waitForLocal) {
+      return mk.Media(
+        api.streamUrl(song.id),
+        httpHeaders: FeiNiuApiClient.imageAuthHeaders(),
+      );
+    }
     final resolved = await api.resolveStreamUrl(api.streamUrl(song.id));
     final uri = resolved.url;
     final headers = resolved.headers;
@@ -1289,13 +1398,64 @@ class PlayerService with WidgetsBindingObserver {
     int startIndex, {
     PlaybackMode? mode,
     String? roamChainId,
+    String? cacheRetentionOwner,
+  }) {
+    final selectedSong = startIndex >= 0 && startIndex < songs.length
+        ? songs[startIndex]
+        : null;
+    if (openPlayerForActiveSelection(selectedSong)) {
+      return Future<void>.value();
+    }
+    final selectedSongId = selectedSong?.id;
+    _pendingSelectionSongId = selectedSongId;
+    return _playQueueInternal(
+      songs,
+      startIndex,
+      mode: mode,
+      roamChainId: roamChainId,
+      cacheRetentionOwner: cacheRetentionOwner,
+    ).whenComplete(() {
+      if (_pendingSelectionSongId == selectedSongId) {
+        _pendingSelectionSongId = null;
+        final processing = _activeEngine.processingState;
+        isLoading.value =
+            processing == EngineProcessingState.loading ||
+            processing == EngineProcessingState.buffering;
+        isPlaying.value = _activeEngine.playing;
+        _emitSnapshot(force: true);
+      }
+    });
+  }
+
+  Future<void> _playQueueInternal(
+    List<SongEntity> songs,
+    int startIndex, {
+    PlaybackMode? mode,
+    String? roamChainId,
+    String? cacheRetentionOwner,
   }) async {
+    final requestedSongId = startIndex >= 0 && startIndex < songs.length
+        ? songs[startIndex].id
+        : null;
     // 递增队列代次必须在等待 _initFuture 之前：恢复流程（_restorePlaybackState）
     // 用 _queueGeneration 判断「用户是否已开始新的播放」来决定是否放弃恢复。
     // 若递增放在 await _initFuture 之后，恢复流程永远看不到用户点播放（playQueue
     // 还卡在等 _initFuture），会把旧会话队列加载进播放器，与用户刚选的队列并发
     // setAudioSources → just_audio 抛 PlayerInterruptedException（Loading interrupted）。
-    _queueGeneration++;
+    final generation = ++_queueGeneration;
+    if (!isCasting.value &&
+        currentSong.value != null &&
+        currentSong.value!.id != requestedSongId) {
+      // 用户选择新歌曲后立即让旧音频静音。不能等到引擎路由完成后再停，
+      // 否则旧歌会在新歌歌词和封面已经切换时继续播放。
+      isPlaying.value = false;
+      isLoading.value = true;
+      _emitSnapshot(force: true);
+      try {
+        await _activeEngine.stop().timeout(const Duration(seconds: 1));
+      } catch (_) {}
+      if (generation != _queueGeneration) return;
+    }
     // 用户显式新建播放队列：清除本会话 media_kit「无法播放」黑名单，让
     // 偶发失败（网络抖动/服务器慢/音频设备瞬时不可用）的歌曲在重新点播时
     // 有机会再试，而不是整个会话内一直被跳过。升级标记
@@ -1308,6 +1468,7 @@ class PlayerService with WidgetsBindingObserver {
     // 等待初始化（含旧播放会话恢复）完成，避免 setAudioSources 与恢复流程
     // 并发交错导致播放器物理 loop/shuffle 状态被覆盖。
     await _initFuture;
+    if (generation != _queueGeneration) return;
     _clearRestoreSession();
     queueExtender = null;
     _isExtendingQueue = false;
@@ -1344,6 +1505,21 @@ class PlayerService with WidgetsBindingObserver {
         ..addAll(capped.$1);
       actualIndex = capped.$2;
     }
+    if (roamChainId != null && roamChainId.isNotEmpty) {
+      unawaited(
+        StreamCacheService.instance.markTransientSongs(
+          playable.map((song) => song.id),
+        ),
+      );
+    }
+    if (cacheRetentionOwner != null && cacheRetentionOwner.isNotEmpty) {
+      unawaited(
+        StreamCacheService.instance.setLongTermOwnerSongs(
+          cacheRetentionOwner,
+          playable.map((song) => song.id),
+        ),
+      );
+    }
     _debugLog(
       'playQueue size=${playable.length} startIndex=$startIndex actualIndex=$actualIndex song=${playable[actualIndex].title}',
     );
@@ -1367,13 +1543,10 @@ class PlayerService with WidgetsBindingObserver {
       return;
     }
 
-    // 双引擎架构：计算引擎路由，只加载当前 run 到对应引擎。
-    _applyEngineKinds(await _computeEngineKinds(playable));
-
     String? loadFailReason;
     Future<bool> loadCurrentRunOnce() async {
       try {
-        await _activateLogicalIndex(actualIndex);
+        await _activateLogicalIndex(actualIndex, preload: true);
         return true;
       } catch (e) {
         loadFailReason = e.toString();
@@ -1397,7 +1570,7 @@ class PlayerService with WidgetsBindingObserver {
         FeiNiuTranscodeService.instance.invalidate(current.id);
 
         try {
-          await _activateLogicalIndex(actualIndex);
+          await _activateLogicalIndex(actualIndex, preload: true);
           return true;
         } catch (e2) {
           loadFailReason = e2.toString();
@@ -1410,6 +1583,12 @@ class PlayerService with WidgetsBindingObserver {
     }
 
     final ok = await loadCurrentRunOnce();
+    if (generation != _queueGeneration) {
+      try {
+        await _activeEngine.stop();
+      } catch (_) {}
+      return;
+    }
     if (!ok) {
       try {
         await _activeEngine.stop();
@@ -1435,9 +1614,12 @@ class PlayerService with WidgetsBindingObserver {
     } else {
       await _applyPlaybackMode(targetMode);
     }
+    if (roamActive) {
+      unawaited(_extendRoamQueue());
+    }
 
     try {
-      await _activeEngine.play();
+      await _startPlayback();
     } catch (e) {
       try {
         await _activeEngine.stop();
@@ -1448,6 +1630,40 @@ class PlayerService with WidgetsBindingObserver {
         debugPrint('PlayerService.playQueue play failed: $e');
       }
     }
+  }
+
+  @visibleForTesting
+  static bool shouldOpenCurrentSongOnly({
+    required String? currentSongId,
+    required String? selectedSongId,
+    required bool isPlaying,
+    required bool isLoading,
+  }) {
+    return currentSongId != null &&
+        currentSongId == selectedSongId &&
+        (isPlaying || isLoading);
+  }
+
+  /// 用户再次选择正在播放或加载的歌曲时，只打开播放页，不重建队列或音源。
+  bool openPlayerForActiveSelection(SongEntity? selectedSong) {
+    if (selectedSong != null && _pendingSelectionSongId == selectedSong.id) {
+      if (!AppLayoutSettings.playerRouteActive.value) {
+        appNavigatorKey.currentState?.pushNamed('/player');
+      }
+      return true;
+    }
+    if (!shouldOpenCurrentSongOnly(
+      currentSongId: currentSong.value?.id,
+      selectedSongId: selectedSong?.id,
+      isPlaying: isPlaying.value,
+      isLoading: isLoading.value,
+    )) {
+      return false;
+    }
+    if (!AppLayoutSettings.playerRouteActive.value) {
+      appNavigatorKey.currentState?.pushNamed('/player');
+    }
+    return true;
   }
 
   /// 按队列上限自动填充后播放。
@@ -1463,19 +1679,36 @@ class PlayerService with WidgetsBindingObserver {
     int startIndex, {
     PlaybackMode? mode,
     String? roamChainId,
+    String? cacheRetentionOwner,
     Future<List<SongEntity>> Function(int page)? fetchMore,
   }) async {
     final idx = startIndex >= 0 && startIndex < initialSongs.length
         ? startIndex
         : 0;
+    final selectedSong = initialSongs.isEmpty ? null : initialSongs[idx];
+    if (openPlayerForActiveSelection(selectedSong)) return;
     // 立即播放：点歌即切歌，currentSong 同步更新，不等后台填充。
-    await playQueue(initialSongs, idx, mode: mode, roamChainId: roamChainId);
+    await playQueue(
+      initialSongs,
+      idx,
+      mode: mode,
+      roamChainId: roamChainId,
+      cacheRetentionOwner: cacheRetentionOwner,
+    );
     // 后台异步填充队列到上限（不阻塞播放切换）。
     if (fetchMore == null) return;
     final cap = _queueCap;
     if (initialSongs.length >= cap) return;
     final gen = _queueGeneration;
-    unawaited(_fillQueueInBackground(initialSongs, fetchMore, cap, gen));
+    unawaited(
+      _fillQueueInBackground(
+        initialSongs,
+        fetchMore,
+        cap,
+        gen,
+        cacheRetentionOwner: cacheRetentionOwner,
+      ),
+    );
   }
 
   /// 后台分页填充队列到上限 [cap]。仅在队列代次未变（用户未切换播放）时
@@ -1485,8 +1718,9 @@ class PlayerService with WidgetsBindingObserver {
     List<SongEntity> base,
     Future<List<SongEntity>> Function(int page) fetchMore,
     int cap,
-    int gen,
-  ) async {
+    int gen, {
+    String? cacheRetentionOwner,
+  }) async {
     final acc = <SongEntity>[];
     var page = 1;
     while (base.length + acc.length < cap) {
@@ -1499,8 +1733,16 @@ class PlayerService with WidgetsBindingObserver {
       }
     }
     if (acc.isEmpty) return;
-    if (gen != _queueGeneration) return; // 用户已切换播放，丢弃本次填充
-    await _appendToQueue(acc);
+    if (gen != _queueGeneration) return;
+    if (cacheRetentionOwner != null && cacheRetentionOwner.isNotEmpty) {
+      unawaited(
+        StreamCacheService.instance.setLongTermOwnerSongs(
+          cacheRetentionOwner,
+          acc.map((song) => song.id),
+        ),
+      );
+    }
+    await _appendToQueue(acc, expectedGeneration: gen);
   }
 
   void _maybePrefetchByRemaining(Duration positionValue) {
@@ -1737,6 +1979,8 @@ class PlayerService with WidgetsBindingObserver {
 
   Future<void> stopAndClear() async {
     _debugLog('stopAndClear');
+    _queueGeneration++;
+    _pendingSelectionSongId = null;
     _clearRestoreSession();
     queueExtender = null;
     _isExtendingQueue = false;
@@ -2219,6 +2463,10 @@ class PlayerService with WidgetsBindingObserver {
     _clearRestoreSession();
     _failSkipStreak = 0; // 用户手动切歌：重置连续失败保护
     _engineRebuiltForThisStreak = false;
+    final roamAppend = _roamAppendInFlight;
+    if (roamAppend != null) await roamAppend;
+    final queueAppend = _queueAppendInFlight;
+    if (queueAppend != null) await queueAppend;
     final list = queue.value;
     final idx = currentIndex.value;
     if (list.isEmpty || idx < 0) return;
@@ -2331,23 +2579,52 @@ class PlayerService with WidgetsBindingObserver {
   ///
   /// 重启后持久化的 roamId 可能在服务端已过期（roam-next 抛异常），此时
   /// 回退到 roam-start 重建新链再追加，避免「队列不增长 → 播完回卷 → 列表循环」。
-  Future<void> _extendRoamQueue() async {
+  Future<void> _extendRoamQueue({int remainingAttempts = 24}) async {
+    if (remainingAttempts <= 0) return;
     // 追加已在途：返回同一个 Future，调用方可 await 它等待本次追加完成。
     final inflight = _roamAppendInFlight;
-    if (inflight != null) return inflight;
+    if (inflight != null) {
+      await inflight;
+      return;
+    }
     if (_roamAppendQueuedCount > 0) return;
     final gen = _queueGeneration;
     _roamAppendQueuedCount = 1;
     final future = _doExtendRoamQueue(gen);
     _roamAppendInFlight = future;
+    var progressed = false;
     try {
-      await future;
+      progressed = await future;
     } finally {
       _roamAppendInFlight = null;
     }
+    final shouldContinue = shouldPrefillRoamQueue(
+      queueLength: queue.value.length,
+      currentIndex: currentIndex.value,
+      queueCap: _queueCap,
+    );
+    if (progressed && gen == _queueGeneration && roamActive && shouldContinue) {
+      await _extendRoamQueue(remainingAttempts: remainingAttempts - 1);
+    }
   }
 
-  Future<void> _doExtendRoamQueue(int gen) async {
+  @visibleForTesting
+  static bool shouldPrefillRoamQueue({
+    required int queueLength,
+    required int currentIndex,
+    required int queueCap,
+  }) {
+    if (queueLength <= 0 || currentIndex < 0 || currentIndex >= queueLength) {
+      return false;
+    }
+    // 队列已达上限时不做后台预填；播到队尾后由 completed 兜底滚动追加，
+    // 避免一次预填连续触发多次“裁头 + 重载当前 run”造成声音卡顿。
+    if (queueLength >= queueCap) return false;
+    final targetAhead = min(8, max(1, queueCap - 1));
+    return queueLength - currentIndex - 1 < targetAhead;
+  }
+
+  Future<bool> _doExtendRoamQueue(int gen) async {
     try {
       final deviceId = await AuthService.instance.ensureDeviceId();
 
@@ -2396,15 +2673,19 @@ class PlayerService with WidgetsBindingObserver {
             : null;
       }
 
+      // 请求期间用户可能已切换到收藏/歌单等新队列。必须先校验代次，
+      // 再写 roamId；否则旧漫游响应会把新队列重新标记成漫游队列。
+      if (gen != _queueGeneration) return false;
       roamId = newRoamId;
-      // 队列已被替换，丢弃本次追加
-      if (gen != _queueGeneration) return;
 
       final nextTrack = appendedTrack;
-      if (nextTrack == null) return;
+      if (nextTrack == null) return false;
       final baseQueue = queue.value;
       final alreadyInQueue = baseQueue.any((s) => s.id == nextTrack.id);
-      if (alreadyInQueue) return;
+      if (alreadyInQueue) {
+        _schedulePersistPlaybackState();
+        return true;
+      }
       final allSongs = [...baseQueue, nextTrack];
 
       // 引擎感知的追加：先更新逻辑队列与引擎路由；若追加的歌曲与当前 run
@@ -2417,61 +2698,111 @@ class PlayerService with WidgetsBindingObserver {
       final appendedKind = nextTranscodes
           ? EngineKind.justAudio
           : await routeForSong(nextTrack);
+      if (gen != _queueGeneration || !identical(queue.value, baseQueue)) {
+        return false;
+      }
       final curKind =
           currentIndex.value >= 0 && currentIndex.value < _engineKinds.length
           ? _engineKinds[currentIndex.value]
           : EngineKind.justAudio;
-      queue.value = allSongs;
+      final appendEngine = _activeEngine;
       if (_engineKinds.length != baseQueue.length) {
         _applyEngineKinds(await _computeEngineKinds(baseQueue));
-      }
-      _engineKinds = [..._engineKinds, appendedKind];
-      _engineTranscodeFlags = [..._engineTranscodeFlags, nextTranscodes];
-
-      // 转码歌不入当前 run 的物理增量插入：它是独立单例 run，播放到它时由
-      // _activateLogicalIndex 重新激活加载（单首转码）。
-      if (!nextTranscodes &&
-          identical(_activeEngine.kind, curKind) &&
-          appendedKind == curKind) {
-        try {
-          final item = await _resolveEngineItem(nextTrack, appendedKind);
-          await _activeEngine.insertItem(_activeEngine.sequenceLength, item);
-        } catch (e) {
-          if (kDebugMode) {
-            debugPrint('PlayerService extendRoamQueue insertItem failed: $e');
-          }
-          // 插入失败回退：仅保留逻辑队列（物理边界切换时重建）
+        if (gen != _queueGeneration || !identical(queue.value, baseQueue)) {
+          return false;
         }
       }
-      queue.value = allSongs;
-      // 追加后超长按上限截断（保留当前歌曲，裁掉最旧的前部）。
-      // 裁剪会把当前歌曲重映射到新索引（裁掉前部后落到 0/靠前位置），
-      // 必须同步 currentIndex/currentSong，否则索引与实际歌曲逐次错位，
-      // 持久化的播放位置/歌名在重启后恢复错乱。
+      final allKinds = [..._engineKinds, appendedKind];
+      final allTranscodeFlags = [..._engineTranscodeFlags, nextTranscodes];
       final curIdx = currentIndex.value;
       final capped = _capQueue(allSongs, curIdx);
       if (capped != null) {
+        final tailStart = allSongs.length - capped.$1.length;
+        final retainedStart = curIdx >= tailStart ? tailStart : max(0, curIdx);
+        final wasPlaying = isPlaying.value;
+        final currentPosition = position.value;
         queue.value = capped.$1;
-        if (capped.$2 != curIdx) {
-          _activateSong(capped.$2);
+        _engineKinds = allKinds.sublist(
+          retainedStart,
+          retainedStart + capped.$1.length,
+        );
+        _engineTranscodeFlags = allTranscodeFlags.sublist(
+          retainedStart,
+          retainedStart + capped.$1.length,
+        );
+        await _activateLogicalIndex(
+          capped.$2,
+          initialPosition: currentPosition,
+          preload: wasPlaying,
+        );
+        if (wasPlaying && !_activeEngine.playing) {
+          await _startPlayback();
+        }
+      } else {
+        queue.value = allSongs;
+        _engineKinds = allKinds;
+        _engineTranscodeFlags = allTranscodeFlags;
+
+        // 转码歌不入当前 run 的物理增量插入：它是独立单例 run，播放到它时由
+        // _activateLogicalIndex 重新激活加载（单首转码）。
+        if (!nextTranscodes &&
+            identical(appendEngine.kind, curKind) &&
+            appendedKind == curKind) {
+          try {
+            final item = await _resolveEngineItem(nextTrack, appendedKind);
+            final inserted = await _insertItemsForQueue(
+              engine: appendEngine,
+              generation: gen,
+              expectedQueue: allSongs,
+              index: appendEngine.sequenceLength,
+              items: [item],
+            );
+            if (!inserted) return false;
+          } catch (e) {
+            if (kDebugMode) {
+              debugPrint('PlayerService extendRoamQueue insertItem failed: $e');
+            }
+            // 插入失败回退：仅保留逻辑队列（物理边界切换时重建）
+          }
         }
       }
       // 后台预加载下一曲文件：漫游模式下队列即真源，下一首已确定，
       // 提前把文件缓存好，切歌时无缝衔接。
-      if (AppCacheSettings.precacheNextSong.value &&
-          StreamCacheService.instance.isEnabled) {
-        StreamCacheService.instance.precacheSong(nextTrack);
+      if (StreamCacheService.instance.isEnabled) {
+        unawaited(StreamCacheService.instance.markTransientUsed(nextTrack.id));
+        StreamCacheService.instance.cacheSong(nextTrack);
       }
+      _precacheRoamMetadata(nextTrack);
+      _schedulePersistPlaybackState();
       _debugLog(
         'extendRoamQueue: appended=${nextTrack.id} queue=[${queue.value.map((s) => s.id).join(',')}]',
       );
+      return true;
     } catch (e) {
       if (kDebugMode) {
         debugPrint('PlayerService extendRoamQueue error: $e');
       }
+      return false;
     } finally {
       _roamAppendQueuedCount--;
     }
+  }
+
+  void _precacheRoamMetadata(SongEntity song) {
+    _roamMetadataPrecache = _roamMetadataPrecache.catchError((_) {}).then((
+      _,
+    ) async {
+      final coverId = song.coverId;
+      await Future.wait<void>([
+        if (coverId != null && coverId.isNotEmpty)
+          CoverLocalCache.downloadToLocal(
+            coverId,
+            updatedAt: song.updatedAt,
+            size: FeiNiuApiClient.coverRequestSize,
+          ).then<void>((_) {}),
+        LyricsRepository().loadLrc(song).then<void>((_) {}),
+      ]);
+    });
   }
 
   /// 播完兜底：当前曲目播完且队列无可播下一首时，追加一首再继续。
@@ -2793,14 +3124,17 @@ class PlayerService with WidgetsBindingObserver {
 
   /// 本地随机播放：把整个列表本地乱序后作为播放队列播放，
   /// 播到末尾时自动把原列表重新乱序续接，不依赖服务器漫游。
-  Future<void> playShuffle(List<SongEntity> songs) async {
+  Future<void> playShuffle(
+    List<SongEntity> songs, {
+    String? cacheRetentionOwner,
+  }) async {
     final base = songs
         .where((s) => (s.uri ?? '').trim().isNotEmpty)
         .where((s) => !_isDefinitelyNonAudio(s))
         .toList();
     if (base.isEmpty) return;
     final playable = [...base]..shuffle(Random());
-    await playQueue(playable, 0);
+    await playQueue(playable, 0, cacheRetentionOwner: cacheRetentionOwner);
     // 本地乱序队列直接进入随机模式（run 不自动回卷，播完逻辑层续接）
     try {
       await _applyPlaybackMode(PlaybackMode.shuffle);
@@ -3224,6 +3558,12 @@ class PlayerService with WidgetsBindingObserver {
     if (actualIndex >= restoredQueue.length) {
       actualIndex = restoredQueue.length - 1;
     }
+    // 漫游队列重启后只保留当前歌及其已预取的后续歌曲，并把当前歌放在
+    // 队首。这样启动即可使用本地持久化队列，不需要先连接 NAS 重建列表。
+    if (savedRoamId != null && savedRoamId.isNotEmpty && actualIndex > 0) {
+      restoredQueue = restoredQueue.sublist(actualIndex);
+      actualIndex = 0;
+    }
     final songId = restoredQueue[actualIndex].id;
     return _PlaybackRestoreState(
       queue: restoredQueue,
@@ -3346,28 +3686,33 @@ class PlayerService with WidgetsBindingObserver {
     final engine = _activeEngine;
     // 状态确认在 play() 之前订阅：just_audio 在 play() 开头就乐观广播
     // playing=true，先订阅才不会漏掉该事件。
-    final stateConfirmed = engine.playing
+    final stateConfirmed =
+        engine.playing && engine.processingState == EngineProcessingState.ready
         ? Future<void>.value()
         : engine.playbackStateStream
-              .firstWhere((s) => s.playing)
-              .timeout(const Duration(seconds: 5))
+              .firstWhere(
+                (s) =>
+                    s.playing &&
+                    s.processingState == EngineProcessingState.ready,
+              )
+              .timeout(const Duration(seconds: 8))
               .then((_) {}, onError: (_) {});
-    try {
-      // play() 的 Future 可能永不完成（平台激活竞态）：短超时等待，超时
-      // 不视为失败——播放请求已发出，是否在播由 stateConfirmed 确认。
-      await engine.play().timeout(const Duration(seconds: 3));
-    } on TimeoutException {
-      // 播放请求已发出，播放状态由 stateConfirmed 等待确认。
-    } catch (e) {
-      // play() 显式抛错（如源不可播）：仅当引擎确实没在播时才视为失败。
-      if (!engine.playing && !isPlaying.value) rethrow;
-      if (kDebugMode) {
-        debugPrint('PlayerService startPlayback play request failed: $e');
-      }
-    }
-    // 等待播放状态确认（正常路径在 play() 乐观广播后即完成，毫秒级；
-    // 超时也只是放行，不阻塞、不产生副作用）。
+    // just_audio 的 play() Future 通常要到暂停或播完才结束，不能等待或用固定
+    // 超时阻塞加载按钮。发出播放命令后只等待 ready + playing 状态。
+    unawaited(
+      engine.play().catchError((Object error) {
+        if (!engine.playing && !isPlaying.value) {
+          unawaited(_handlePlayerError(EngineError(message: '$error')));
+        } else if (kDebugMode) {
+          debugPrint('PlayerService startPlayback play request failed: $error');
+        }
+      }),
+    );
     await stateConfirmed;
+    final startedSong = currentSong.value;
+    if (startedSong != null && engine.playing) {
+      unawaited(StreamCacheService.instance.markTransientUsed(startedSong.id));
+    }
     _completeRestoreSessionIfReady();
     _startBackgroundAudioKeepAliveIfNeeded();
   }
@@ -3764,10 +4109,11 @@ class PlayerService with WidgetsBindingObserver {
     if (extender == null) return;
 
     _isExtendingQueue = true;
+    final generation = _queueGeneration;
     try {
       final newSongs = await extender();
-      if (newSongs.isEmpty) return;
-      await _appendToQueue(newSongs);
+      if (newSongs.isEmpty || generation != _queueGeneration) return;
+      await _appendToQueue(newSongs, expectedGeneration: generation);
     } catch (e) {
       if (kDebugMode) {
         debugPrint('PlayerService autoExtendQueue error: $e');
@@ -3777,13 +4123,56 @@ class PlayerService with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _appendToQueue(List<SongEntity> newSongs) async {
+  Future<void> _appendToQueue(
+    List<SongEntity> newSongs, {
+    int? expectedGeneration,
+  }) {
+    final previous = _queueAppendChain;
+    final task = previous
+        .catchError((_) {})
+        .then(
+          (_) => _appendToQueueInternal(
+            newSongs,
+            expectedGeneration: expectedGeneration,
+          ),
+        );
+    _queueAppendChain = task.catchError((_) {});
+    _queueAppendInFlight = task;
+    return task.whenComplete(() {
+      if (identical(_queueAppendInFlight, task)) {
+        _queueAppendInFlight = null;
+      }
+    });
+  }
+
+  Future<void> _appendToQueueInternal(
+    List<SongEntity> newSongs, {
+    int? expectedGeneration,
+  }) async {
     if (newSongs.isEmpty) return;
+    if (expectedGeneration != null && expectedGeneration != _queueGeneration) {
+      return;
+    }
 
     final oldQueue = queue.value;
+    final appendGeneration = _queueGeneration;
+    final appendEngine = _activeEngine;
     final currentIdx = currentIndex.value;
     final pos = position.value;
     final wasPlaying = isPlaying.value;
+    final canAppendInPlace =
+        currentIdx >= 0 &&
+        currentIdx < oldQueue.length &&
+        _engineKinds.length == oldQueue.length &&
+        _engineTranscodeFlags.length == oldQueue.length &&
+        _activeRunStart <= currentIdx &&
+        currentIdx < _activeRunStart + _activeEngine.sequenceLength;
+    final oldBounds = canAppendInPlace ? _runBounds(currentIdx) : null;
+    final oldRunAligned =
+        oldBounds != null &&
+        oldBounds.start == _activeRunStart &&
+        oldBounds.kind == appendEngine.kind &&
+        oldBounds.end - oldBounds.start + 1 == appendEngine.sequenceLength;
 
     var allSongs = [...oldQueue, ...newSongs];
     // 追加后可能超长：按上限截断（保留当前歌曲，裁掉最旧的前部）
@@ -3793,10 +4182,72 @@ class PlayerService with WidgetsBindingObserver {
       allSongs = capped.$1;
       newCurrentIdx = capped.$2;
     }
-    queue.value = allSongs;
 
-    // 重建引擎路由并重载当前 run（保持位置/播放态）。
-    _applyEngineKinds(await _computeEngineKinds(allSongs));
+    final computed = await _computeEngineKinds(
+      allSongs,
+      prioritySongId: newCurrentIdx >= 0 && newCurrentIdx < allSongs.length
+          ? allSongs[newCurrentIdx].id
+          : null,
+    );
+    if (appendGeneration != _queueGeneration ||
+        !identical(queue.value, oldQueue)) {
+      return;
+    }
+    queue.value = allSongs;
+    _applyEngineKinds(computed);
+
+    // 单纯向队尾补分页数据时，当前 run 本身没有变化。若新歌曲与当前 run
+    // 连续，只把这些音源插入原生队列；若位于其它引擎 run，则暂时只保留在
+    // 逻辑队列，真正切到该 run 时再加载。两种情况都不重载当前歌曲。
+    if (capped == null && oldRunAligned) {
+      final newBounds = _runBounds(newCurrentIdx);
+      if (newBounds.start == oldBounds.start &&
+          newBounds.kind == oldBounds.kind) {
+        try {
+          final firstNewRunIndex = oldBounds.end + 1;
+          if (newBounds.end >= firstNewRunIndex) {
+            final items = await Future.wait(
+              List.generate(newBounds.end - firstNewRunIndex + 1, (offset) {
+                final index = firstNewRunIndex + offset;
+                return _resolveEngineItem(
+                  allSongs[index],
+                  newBounds.kind,
+                  waitForLocal: false,
+                );
+              }),
+            );
+            if (appendGeneration != _queueGeneration ||
+                !identical(queue.value, allSongs)) {
+              return;
+            }
+            final inserted = await _insertItemsForQueue(
+              engine: appendEngine,
+              generation: appendGeneration,
+              expectedQueue: allSongs,
+              index: appendEngine.sequenceLength,
+              items: items,
+              pendingLogicalIndex: newCurrentIdx,
+            );
+            if (!inserted) return;
+          }
+          _schedulePersistPlaybackState();
+          _emitSnapshot(force: true);
+          return;
+        } catch (error) {
+          if (kDebugMode) {
+            debugPrint(
+              'PlayerService append queue in place failed, reloading: $error',
+            );
+          }
+        }
+      }
+    }
+
+    // 队列发生裁剪或物理 run 已失配时才重载，并恢复播放位置。
+    if (appendGeneration != _queueGeneration ||
+        !identical(queue.value, allSongs)) {
+      return;
+    }
     try {
       await _activateLogicalIndex(newCurrentIdx, initialPosition: pos);
       if (wasPlaying && !_activeEngine.playing) {
@@ -3876,6 +4327,7 @@ class PlayerService with WidgetsBindingObserver {
       _hydrateAndSetCurrentSong(song);
       if (songChanged) {
         unawaited(FeiNiuApiClient.instance.reportTrackPlay(song.id));
+        unawaited(StreamCacheService.instance.markTransientUsed(song.id));
       }
       _warmupPlaybackSources(song, nextSong: _nextSongForIndex(list, idx));
       if (songChanged && StreamCacheService.instance.isEnabled) {
@@ -4066,6 +4518,7 @@ class PlayerService with WidgetsBindingObserver {
   Future<AudioSource> _sourceForSong(
     SongEntity song, {
     bool forceRefresh = false,
+    bool allowNetworkResolution = true,
   }) async {
     final api = FeiNiuApiClient.instance;
     if (api.baseUrl.isNotEmpty) {
@@ -4088,6 +4541,7 @@ class PlayerService with WidgetsBindingObserver {
         final complete = await StreamCacheService.instance.completeFileFor(
           song.id,
           song: song,
+          allowMetadataLookup: allowNetworkResolution,
         );
         if (complete != null) {
           return AudioSource.file(complete.path);
@@ -4099,7 +4553,8 @@ class PlayerService with WidgetsBindingObserver {
       // （即使下载缓存关闭也走转码）。面板选「直连」的歌跳过转码。
       // **CUE 曲也走转码**：服务器按 guid 返回裁切好的单曲 HLS，无需裁剪；
       // 转码失败才落回下方 CUE 直连 + ClippingAudioSource 裁剪。
-      if (!_forceDirectSongIds.contains(song.id) &&
+      if (allowNetworkResolution &&
+          !_forceDirectSongIds.contains(song.id) &&
           !_transcodeFailedSongIds.contains(song.id)) {
         final hls = await _transcodedSourceFor(song);
         if (hls != null) return hls;

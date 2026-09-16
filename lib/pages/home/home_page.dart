@@ -614,6 +614,7 @@ class _HomePageState extends State<HomePage>
     List<SongEntity> preview,
     _HomePlaySource source,
   ) {
+    if (_player.openPlayerForActiveSelection(song)) return;
     unawaited(_playListWithFullFetch(preview, source, song: song));
   }
 

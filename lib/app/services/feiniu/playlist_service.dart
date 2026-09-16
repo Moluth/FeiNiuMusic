@@ -1,3 +1,7 @@
+import 'package:flutter/foundation.dart';
+
+import '../audio/stream_cache_service.dart';
+import 'account_store.dart';
 import 'api_client.dart';
 import 'api_models.dart';
 
@@ -8,6 +12,16 @@ class FeiNiuPlaylistService {
   static final FeiNiuPlaylistService instance = FeiNiuPlaylistService._();
 
   final FeiNiuApiClient _api = FeiNiuApiClient.instance;
+
+  Future<void> _syncOwner(Future<void> update) async {
+    try {
+      await update;
+    } catch (error) {
+      if (kDebugMode) {
+        debugPrint('[PlaylistService] cache owner update failed: $error');
+      }
+    }
+  }
 
   /// 获取歌单列表（分页）。
   ///
@@ -27,13 +41,55 @@ class FeiNiuPlaylistService {
     int page = 1,
     int size = 300,
   }) async {
-    final pageData = await _api.getPlaylistTracks(
-      playlistGUID: playlistGuid,
+    final pageData = await getPlaylistTrackPage(
+      playlistGuid,
       page: page,
       size: size,
     );
     return pageData.list;
   }
+
+  Future<FeiNiuPageData<FeiNiuTrack>> getPlaylistTrackPage(
+    String playlistGuid, {
+    int page = 1,
+    int size = 300,
+  }) async {
+    final owner = _playlistOwner(playlistGuid);
+    final pageData = await _api.getPlaylistTracks(
+      playlistGUID: playlistGuid,
+      page: page,
+      size: size,
+    );
+    await _syncOwner(
+      StreamCacheService.instance.setLongTermOwnerSongs(
+        owner,
+        pageData.list.map((track) => track.guid),
+        replace:
+            page == 1 && (size < 0 || pageData.list.length >= pageData.total),
+      ),
+    );
+    return pageData;
+  }
+
+  Future<void> syncPlaylistOwner(
+    String playlistGuid,
+    Iterable<String> trackGuids, {
+    bool replace = false,
+  }) {
+    return _syncOwner(
+      StreamCacheService.instance.setLongTermOwnerSongs(
+        _playlistOwner(playlistGuid),
+        trackGuids,
+        replace: replace,
+      ),
+    );
+  }
+
+  String _playlistOwner(String playlistGuid) =>
+      StreamCacheService.playlistRetentionOwner(
+        playlistGuid,
+        accountId: AccountStore.instance.currentAccountId.value,
+      );
 
   /// 创建歌单。
   ///
@@ -52,12 +108,18 @@ class FeiNiuPlaylistService {
 
   /// 删除歌单
   Future<void> deletePlaylist(String guid) async {
+    final owner = _playlistOwner(guid);
     await _api.deletePlaylist(guid);
+    await _syncOwner(StreamCacheService.instance.removeLongTermOwner(owner));
   }
 
   /// 清除歌单内无效歌曲，返回清除数量
   Future<int> purgeInvalidTracks(String playlistGuid) async {
-    return _api.purgeInvalidTracks(playlistGuid);
+    final removed = await _api.purgeInvalidTracks(playlistGuid);
+    if (removed > 0) {
+      await getPlaylistTracks(playlistGuid, size: -1);
+    }
+    return removed;
   }
 
   /// 编辑歌单（名称/封面）
@@ -71,18 +133,29 @@ class FeiNiuPlaylistService {
 
   /// 添加歌曲到歌单
   Future<void> addTrack(String playlistGuid, String trackGuid) async {
+    final owner = _playlistOwner(playlistGuid);
     await _api.addTrackToPlaylist(playlistGuid, [trackGuid]);
+    await _syncOwner(
+      StreamCacheService.instance.setLongTermOwnerSongs(owner, [trackGuid]),
+    );
   }
 
   /// 添加多首歌曲到歌单
-  Future<void> addTracks(
-      String playlistGuid, List<String> trackGuids) async {
+  Future<void> addTracks(String playlistGuid, List<String> trackGuids) async {
+    final owner = _playlistOwner(playlistGuid);
     await _api.addTrackToPlaylist(playlistGuid, trackGuids);
+    await _syncOwner(
+      StreamCacheService.instance.setLongTermOwnerSongs(owner, trackGuids),
+    );
   }
 
   /// 从歌单移除歌曲
   Future<void> removeTrack(String playlistGuid, String trackGuid) async {
+    final owner = _playlistOwner(playlistGuid);
     await _api.removeTrackFromPlaylist(playlistGuid, trackGuid);
+    await _syncOwner(
+      StreamCacheService.instance.removeLongTermOwnerSongs(owner, [trackGuid]),
+    );
   }
 
   /// 从歌单批量移除歌曲（一次请求提交全部）
@@ -90,6 +163,10 @@ class FeiNiuPlaylistService {
     String playlistGuid,
     List<String> trackGuids,
   ) async {
+    final owner = _playlistOwner(playlistGuid);
     await _api.removeTracksFromPlaylist(playlistGuid, trackGuids);
+    await _syncOwner(
+      StreamCacheService.instance.removeLongTermOwnerSongs(owner, trackGuids),
+    );
   }
 }

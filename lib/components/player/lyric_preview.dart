@@ -2,8 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_lyric/core/lyric_style.dart';
 import 'package:flutter_lyric/widgets/lyric_view.dart';
 
-import '../../../app/services/lyrics/lyrics_service.dart';
-import '../../../app/services/lyrics/lyrics_view_colors.dart';
+import '../../app/services/lyrics/lyrics_service.dart';
+import '../../app/services/lyrics/lyrics_view_colors.dart';
 
 /// 播放页 / 底部控制栏的逐字歌词预览。
 ///
@@ -169,10 +169,7 @@ class LyricPreview extends StatelessWidget {
         final preview = ClipRect(
           child: SizedBox(
             height: height,
-            child: LyricView(
-              controller: lyrics.controller,
-              style: style,
-            ),
+            child: LyricView(controller: lyrics.controller, style: style),
           ),
         );
         if (!fadeEdges) {

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -32,7 +33,28 @@ class StreamCacheService {
   static const String legacyDirName = 'stream_cache';
 
   /// 旧版缓存目录是否已清理的持久化标记（SharedPreferences）。
-  static const String _prefsLegacyCleanupDone = 'stream_cache_legacy_cleanup_done';
+  static const String _prefsLegacyCleanupDone =
+      'stream_cache_legacy_cleanup_done';
+  static const String _prefsLongTermOwners = 'stream_cache_long_term_owners_v1';
+  static const String _prefsTransientTouched =
+      'stream_cache_transient_touched_v1';
+  static const Duration transientRetention = Duration(days: 10);
+  static const String favoriteRetentionOwner = 'favorite';
+
+  static String favoriteRetentionOwnerFor(String? accountId) =>
+      accountId == null || accountId.isEmpty
+      ? favoriteRetentionOwner
+      : 'account:$accountId:$favoriteRetentionOwner';
+
+  static String accountRetentionOwnerPrefix(String accountId) =>
+      'account:$accountId:';
+
+  static String playlistRetentionOwner(String playlistId, {String? accountId}) {
+    final owner = 'playlist:$playlistId';
+    return accountId == null || accountId.isEmpty
+        ? owner
+        : 'account:$accountId:$owner';
+  }
 
   /// 兜底扩展名（无法确认格式时的默认后缀）。
   static const String defaultExtension = 'mp3';
@@ -41,8 +63,14 @@ class StreamCacheService {
   final Map<String, String> _formatExtensions = {};
 
   final Map<String, StreamAudioCacheSource> _sources = {};
+  final Map<String, Set<String>> _longTermOwners = {};
+  final Map<String, int> _transientTouchedAt = {};
   Directory? _dir;
   Future<void>? _initFuture;
+  Future<void>? _retentionLoadFuture;
+  Future<void> _retentionMutationChain = Future<void>.value();
+  Future<void> _retentionWriteChain = Future<void>.value();
+  DateTime? _lastExpirationSweep;
 
   /// 当前播放歌曲 id —— 由 PlayerService 每次切歌时设置（避免服务间循环依赖）。
   String? currentSongId;
@@ -51,12 +79,18 @@ class StreamCacheService {
     AppCacheSettings.cacheLimitMb.addListener(_onLimitChanged);
   }
 
-  /// 缓存是否开启（本方案缓存始终开启，默认 1GB 上限；`> 0` 即为开启）
-  bool get isEnabled => AppCacheSettings.cacheLimitMb.value > 0;
+  /// 音频缓存始终开启；容量 0 表示不限制大小。
+  bool get isEnabled => true;
+
+  /// 启动后低优先级维护：清理中断文件、超过保留期的临时歌曲和容量超限项。
+  Future<void> performMaintenance() async {
+    await _ensureDir();
+  }
 
   Future<Directory> _ensureDir() async {
     await _resolveDir();
     await _cleanupStaleParts(_dir!);
+    await cleanupExpiredTransientCache();
     await evictIfNeeded();
     return _dir!;
   }
@@ -103,9 +137,260 @@ class StreamCacheService {
     _scheduledDownloadIds.clear();
     _pendingDownloads.clear();
     _activeDownloads = 0;
+    _longTermOwners.clear();
+    _transientTouchedAt.clear();
     _dir = null;
     _initFuture = null;
+    _retentionLoadFuture = null;
+    _retentionMutationChain = Future<void>.value();
+    _retentionWriteChain = Future<void>.value();
+    _lastExpirationSweep = null;
     currentSongId = null;
+  }
+
+  Future<void> setLongTermOwnerSongs(
+    String owner,
+    Iterable<String> songIds, {
+    bool replace = false,
+  }) {
+    return _serializeRetentionMutation(
+      () => _setLongTermOwnerSongs(owner, songIds, replace: replace),
+    );
+  }
+
+  Future<void> _setLongTermOwnerSongs(
+    String owner,
+    Iterable<String> songIds, {
+    required bool replace,
+  }) async {
+    await _ensureRetentionLoaded();
+    final ids = songIds.where((id) => id.isNotEmpty).toSet();
+    if (replace) {
+      final removed = (_longTermOwners[owner] ?? const <String>{}).difference(
+        ids,
+      );
+      _longTermOwners[owner] = ids;
+      final now = DateTime.now().millisecondsSinceEpoch;
+      for (final id in removed) {
+        if (!_isLongTermSong(id, excludingOwner: owner)) {
+          _transientTouchedAt[id] = now;
+        }
+      }
+    } else {
+      _longTermOwners.putIfAbsent(owner, () => <String>{}).addAll(ids);
+    }
+    if (_longTermOwners[owner]!.isEmpty) {
+      _longTermOwners.remove(owner);
+    }
+    await _persistRetentionPolicy();
+  }
+
+  Future<void> removeLongTermOwnerSongs(
+    String owner,
+    Iterable<String> songIds,
+  ) {
+    return _serializeRetentionMutation(
+      () => _removeLongTermOwnerSongs(owner, songIds),
+    );
+  }
+
+  Future<void> _removeLongTermOwnerSongs(
+    String owner,
+    Iterable<String> songIds,
+  ) async {
+    await _ensureRetentionLoaded();
+    final owned = _longTermOwners[owner];
+    if (owned == null) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    for (final id in songIds) {
+      if (owned.remove(id)) {
+        _transientTouchedAt[id] = now;
+      }
+    }
+    if (owned.isEmpty) _longTermOwners.remove(owner);
+    await _persistRetentionPolicy();
+  }
+
+  Future<void> removeLongTermOwner(String owner) {
+    return _serializeRetentionMutation(() => _removeLongTermOwner(owner));
+  }
+
+  Future<void> _removeLongTermOwner(String owner) async {
+    await _ensureRetentionLoaded();
+    final removed = _longTermOwners.remove(owner);
+    if (removed == null) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    for (final id in removed) {
+      _transientTouchedAt[id] = now;
+    }
+    await _persistRetentionPolicy();
+  }
+
+  Future<void> removeLongTermOwnersWithPrefix(String prefix) {
+    return _serializeRetentionMutation(
+      () => _removeLongTermOwnersWithPrefix(prefix),
+    );
+  }
+
+  Future<void> _removeLongTermOwnersWithPrefix(String prefix) async {
+    await _ensureRetentionLoaded();
+    final matchingOwners = _longTermOwners.keys
+        .where((owner) => owner.startsWith(prefix))
+        .toList();
+    if (matchingOwners.isEmpty) return;
+    final removedIds = <String>{};
+    for (final owner in matchingOwners) {
+      removedIds.addAll(_longTermOwners.remove(owner) ?? const <String>{});
+    }
+    final now = DateTime.now().millisecondsSinceEpoch;
+    for (final id in removedIds) {
+      if (!_isLongTermSong(id)) {
+        _transientTouchedAt[id] = now;
+      }
+    }
+    await _persistRetentionPolicy();
+  }
+
+  Future<void> markTransientUsed(String songId, {DateTime? usedAt}) {
+    return markTransientSongs([songId], usedAt: usedAt);
+  }
+
+  Future<void> markTransientSongs(
+    Iterable<String> songIds, {
+    DateTime? usedAt,
+  }) {
+    return _serializeRetentionMutation(
+      () => _markTransientSongs(songIds, usedAt: usedAt),
+    );
+  }
+
+  Future<void> _markTransientSongs(
+    Iterable<String> songIds, {
+    DateTime? usedAt,
+  }) async {
+    await _ensureRetentionLoaded();
+    final timestamp = (usedAt ?? DateTime.now()).millisecondsSinceEpoch;
+    var changed = false;
+    for (final songId in songIds) {
+      if (songId.isEmpty) continue;
+      _transientTouchedAt[songId] = timestamp;
+      changed = true;
+    }
+    if (!changed) return;
+    await _persistRetentionPolicy();
+  }
+
+  Future<void> cleanupExpiredTransientCache({DateTime? now}) {
+    return _serializeRetentionMutation(
+      () => _cleanupExpiredTransientCache(now: now),
+    );
+  }
+
+  Future<void> _cleanupExpiredTransientCache({DateTime? now}) async {
+    await _resolveDir();
+    final current = now ?? DateTime.now();
+    if (now == null &&
+        _lastExpirationSweep != null &&
+        current.difference(_lastExpirationSweep!) < const Duration(days: 1)) {
+      return;
+    }
+    _lastExpirationSweep = current;
+    await _ensureRetentionLoaded();
+    final longTermIds = _allLongTermSongIds();
+    final cutoff = current.subtract(transientRetention).millisecondsSinceEpoch;
+    final expired = _transientTouchedAt.entries
+        .where(
+          (entry) => entry.value < cutoff && !longTermIds.contains(entry.key),
+        )
+        .toList();
+    for (final entry in expired) {
+      final id = entry.key;
+      bool canDelete() =>
+          id != currentSongId &&
+          !_sources.containsKey(id) &&
+          !_isLongTermSong(id) &&
+          _transientTouchedAt[id] == entry.value &&
+          entry.value < cutoff;
+      if (!canDelete()) continue;
+      final deleted = await _deleteCacheFiles(id, canDelete: canDelete);
+      if (deleted && canDelete()) {
+        _transientTouchedAt.remove(id);
+      }
+    }
+    await _cleanupUntrackedExpiredFiles(cutoff);
+    if (expired.isNotEmpty) await _persistRetentionPolicy();
+  }
+
+  Future<void> _serializeRetentionMutation(Future<void> Function() operation) {
+    final next = _retentionMutationChain
+        .catchError((_) {})
+        .then((_) => operation());
+    _retentionMutationChain = next.catchError((_) {});
+    return next;
+  }
+
+  Future<void> _ensureRetentionLoaded() {
+    return _retentionLoadFuture ??= _loadRetentionPolicy();
+  }
+
+  Future<void> _loadRetentionPolicy() async {
+    final prefs = await SharedPreferences.getInstance();
+    try {
+      final ownersRaw = prefs.getString(_prefsLongTermOwners);
+      final owners = ownersRaw == null ? null : jsonDecode(ownersRaw);
+      if (owners is Map) {
+        for (final entry in owners.entries) {
+          final value = entry.value;
+          if (value is List) {
+            _longTermOwners[entry.key.toString()] = value
+                .map((id) => id.toString())
+                .toSet();
+          }
+        }
+      }
+      final touchedRaw = prefs.getString(_prefsTransientTouched);
+      final touched = touchedRaw == null ? null : jsonDecode(touchedRaw);
+      if (touched is Map) {
+        for (final entry in touched.entries) {
+          final timestamp = entry.value;
+          if (timestamp is num) {
+            _transientTouchedAt[entry.key.toString()] = timestamp.toInt();
+          }
+        }
+      }
+    } catch (_) {
+      _longTermOwners.clear();
+      _transientTouchedAt.clear();
+    }
+  }
+
+  Future<void> _persistRetentionPolicy() async {
+    final ownersJson = jsonEncode(
+      _longTermOwners.map(
+        (owner, ids) => MapEntry(owner, ids.toList(growable: false)),
+      ),
+    );
+    final touchedJson = jsonEncode(_transientTouchedAt);
+    final write = _retentionWriteChain.then((_) async {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_prefsLongTermOwners, ownersJson);
+      await prefs.setString(_prefsTransientTouched, touchedJson);
+    });
+    _retentionWriteChain = write.catchError((_) {});
+    await write;
+  }
+
+  Set<String> _allLongTermSongIds() {
+    return <String>{for (final ids in _longTermOwners.values) ...ids};
+  }
+
+  bool _isLongTermSong(String songId, {String? excludingOwner}) {
+    for (final entry in _longTermOwners.entries) {
+      if (entry.key != excludingOwner && entry.value.contains(songId)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /// 净化 songId 为合法文件名片段
@@ -142,9 +427,11 @@ class StreamCacheService {
   String? extensionForSongSync(SongEntity song) {
     final cached = _formatExtensions[song.id];
     if (cached != null) return cached;
-    final ext = _extensionForFormat(song.format) ?? _extensionForFormat(
-      FeiNiuTranscodeService.instance.resolvedFormatForSync(song),
-    );
+    final ext =
+        _extensionForFormat(song.format) ??
+        _extensionForFormat(
+          FeiNiuTranscodeService.instance.resolvedFormatForSync(song),
+        );
     if (ext != null) _formatExtensions[song.id] = ext;
     return ext;
   }
@@ -179,7 +466,9 @@ class StreamCacheService {
     final m = mime.trim().toLowerCase();
     if (m.contains('flac')) return 'flac';
     if (m.contains('mp3') || m.contains('mpeg')) return 'mp3';
-    if (m.contains('m4a') || m.contains('aac') || m.contains('mp4')) return 'm4a';
+    if (m.contains('m4a') || m.contains('aac') || m.contains('mp4')) {
+      return 'm4a';
+    }
     if (m.contains('ogg')) return 'ogg';
     if (m.contains('wav') || m.contains('wave')) return 'wav';
     if (m.contains('dsd') || m.contains('dsf')) return 'dsf';
@@ -225,20 +514,54 @@ class StreamCacheService {
     String songId, {
     SongEntity? song,
     String? ext,
+    bool allowMetadataLookup = true,
   }) async {
     if (!isEnabled) return null;
     await _resolveDir();
-    final resolved = ext ??
-        (song != null ? await extensionForSong(song) : defaultExtension);
-    final file = _cacheFileFor(songId, resolved);
-    if (await file.exists()) return file;
-    // 兼容历史 `.mp3` 后缀缓存（改名前的旧文件）
-    if (resolved != 'mp3') {
-      final legacy = _cacheFileFor(songId, 'mp3');
+
+    final localExtension =
+        ext ?? (song == null ? null : extensionForSongSync(song));
+    if (localExtension != null) {
+      final local = _cacheFileFor(songId, localExtension);
+      if (await local.exists()) return local;
+    }
+
+    // 格式未知时直接探测现有文件，不调用 /track/metadata。缓存命中的播放
+    // 路径必须完全离线可用，不能为了确认扩展名反过来等待服务器。
+    for (final candidateExtension in _knownCacheExtensions) {
+      if (candidateExtension == localExtension) continue;
+      final candidate = _cacheFileFor(songId, candidateExtension);
+      if (await candidate.exists()) {
+        _formatExtensions[songId] = candidateExtension;
+        return candidate;
+      }
+    }
+
+    if (!allowMetadataLookup || song == null) return null;
+    final resolved = await extensionForSong(song);
+    final resolvedFile = _cacheFileFor(songId, resolved);
+    if (await resolvedFile.exists()) return resolvedFile;
+    if (resolved != defaultExtension) {
+      final legacy = _cacheFileFor(songId, defaultExtension);
       if (await legacy.exists()) return legacy;
     }
     return null;
   }
+
+  static const List<String> _knownCacheExtensions = <String>[
+    'mp3',
+    'flac',
+    'm4a',
+    'aac',
+    'ogg',
+    'wav',
+    'dsf',
+    'dff',
+    'ape',
+    'wma',
+    'aiff',
+    'dts',
+  ];
 
   /// 转码缓存文件基础名（`tc_<safeId>_<codec>.mp4`）。
   ///
@@ -336,26 +659,30 @@ class StreamCacheService {
     if (existing != null) return existing;
 
     await _ensureDir();
-    final ext = await extensionForSong(song);
-    // 网盘音乐可能被服务器 302 反向代理到 CDN/内网地址：先预解析最终 URL
-    // （同源保留 Cookie / 跨主机剥离）。缓存下载器用 dart:io HttpClient，
-    // SDK shouldCopyHeaderOnRedirect 仅同 scheme+port 复制 Cookie，跨主机
-    // 跟随 302 会丢 music-token → 401 → 播放转圈；用解析后的最终 URL 下载
-    // 绕开重定向差异。失败时 resolveStreamUrl 静默回退原始 URL，行为不变。
-    final resolved = await FeiNiuApiClient.instance
-        .resolveStreamUrl(FeiNiuApiClient.instance.streamUrl(song.id));
+    final ext = extensionForSongSync(song) ?? await extensionForSong(song);
+    final api = FeiNiuApiClient.instance;
+    final streamUrl = api.streamUrl(song.id);
+    final authHeaders = FeiNiuApiClient.imageAuthHeaders();
     final source = StreamAudioCacheSource(
       songId: song.id,
-      uri: Uri.parse(resolved.url),
-      headers: resolved.headers,
+      uri: Uri.parse(streamUrl),
+      headers: authHeaders,
       cacheFile: _cacheFileFor(song.id, ext),
+      endpointResolver: () async {
+        // 网盘音乐可能被 302 到 CDN/内网地址。延迟到该音源真正被读取时才
+        // 解析，避免创建大播放队列时逐首等待网络。
+        final resolved = await api.resolveStreamUrl(streamUrl);
+        return (uri: Uri.parse(resolved.url), headers: resolved.headers);
+      },
     );
     _sources[song.id] = source;
     // 下载完成（无论成败）后移出注册表并尝试淘汰
-    unawaited(source.downloadDone.then(
-      (_) => _onSourceFinished(song.id),
-      onError: (_) => _onSourceFinished(song.id),
-    ));
+    unawaited(
+      source.downloadDone.then(
+        (_) => _onSourceFinished(song.id),
+        onError: (_) => _onSourceFinished(song.id),
+      ),
+    );
     return source;
   }
 
@@ -368,6 +695,13 @@ class StreamCacheService {
   Future<void> invalidate(String songId) async {
     await _ensureDir();
     _sources.remove(songId);
+    await _deleteCacheFiles(songId);
+  }
+
+  Future<bool> _deleteCacheFiles(
+    String songId, {
+    bool Function()? canDelete,
+  }) async {
     final base = _cacheFileBaseFor(songId);
     final candidates = <File>[
       File(base),
@@ -375,17 +709,26 @@ class StreamCacheService {
       File('$base.mime'),
     ];
     // 历史/其它后缀的完整文件也一并清除
-    for (final ext in ['mp3', 'flac', 'm4a', 'ogg', 'wav', 'dsf', 'dff', 'ape', 'wma', 'aiff', 'dts']) {
+    for (final ext in _knownCacheExtensions) {
       final f = File(_cacheFileFor(songId, ext).path);
       if (!candidates.contains(f)) candidates.add(f);
+      candidates
+        ..add(File('${f.path}.part'))
+        ..add(File('${f.path}.mime'));
     }
     // 转码缓存（tc_<id>_<codec>.mp4 及其 .part）也一并清除
     candidates.addAll(await _transcodeFilesFor(songId));
     for (final f in candidates) {
       try {
-        if (await f.exists()) await f.delete();
+        if (canDelete != null && !canDelete()) return false;
+        if (await f.exists()) {
+          if (canDelete != null && !canDelete()) return false;
+          await f.delete();
+        }
       } catch (_) {}
     }
+    _formatExtensions.remove(songId);
+    return true;
   }
 
   /// 某首歌的全部转码缓存文件（`tc_<safeId>_<codec>.mp4` / `.part` / 各 codec）。
@@ -423,6 +766,12 @@ class StreamCacheService {
     unawaited(_precacheSongAsync(song));
   }
 
+  /// 低优先级离线缓存调用方使用：等待该歌曲下载完成，便于按顺序控制带宽。
+  Future<void> cacheSongAndWait(SongEntity song) async {
+    if (!isEnabled) return;
+    await _precacheSongAsync(song);
+  }
+
   /// 后台下载并发上限：media_kit 每首歌都会触发整首下载，慢网/中继下同时
   /// 下载多首会打开大量 HTTP 连接 + 文件句柄，叠加 mpv/封面后逼近 macOS
   /// 单进程 FD 上限（ulimit -n=256）→ EMFILE「Too many open files」。
@@ -436,8 +785,12 @@ class StreamCacheService {
     return _scheduleDownload(song.id, () async {
       try {
         final source = await sourceForSong(song);
-        if (source.isComplete) return;
-        await source.precache();
+        if (!source.isComplete) {
+          await source.precache();
+        }
+        if (source.isComplete) {
+          await markTransientUsed(song.id);
+        }
       } catch (_) {
         // 预缓存失败静默忽略（不影响播放）
       }
@@ -490,10 +843,7 @@ class StreamCacheService {
 
   /// 链式预缓存的等待节点：等待某首歌缓存下载完成。
   /// 已完整 → 立即返回；有在途下载 → join；无下载 → 返回（链不启动）。
-  Future<void> waitForComplete(
-    String songId, {
-    SongEntity? song,
-  }) async {
+  Future<void> waitForComplete(String songId, {SongEntity? song}) async {
     if (!isEnabled) return;
     if (await completeFileFor(songId, song: song) != null) return;
     final source = _sources[songId];
@@ -506,18 +856,28 @@ class StreamCacheService {
   }
 
   /// 上限淘汰：总量超限时删最旧完整文件直到 ≤ 上限。
-  Future<void> evictIfNeeded({Set<String>? protectedSongIds}) async {
+  Future<void> evictIfNeeded({Set<String>? protectedSongIds}) {
+    return _serializeRetentionMutation(
+      () => _evictIfNeeded(protectedSongIds: protectedSongIds),
+    );
+  }
+
+  Future<void> _evictIfNeeded({Set<String>? protectedSongIds}) async {
     if (!isEnabled) return;
     final dir = _dir;
     // 目录未初始化（从未下载过）无需扫描/淘汰
     if (dir == null) return;
 
-    final limitBytes = AppCacheSettings.cacheLimitMb.value * 1024 * 1024;
+    final limitMb = AppCacheSettings.cacheLimitMb.value;
+    if (limitMb == 0) return;
+    final limitBytes = limitMb * 1024 * 1024;
+    await _ensureRetentionLoaded();
 
     final protected = <String>{
       if (currentSongId != null) safeCacheName(currentSongId!),
       for (final id in _sources.keys) safeCacheName(id),
       for (final id in protectedSongIds ?? const <String>{}) safeCacheName(id),
+      for (final id in _allLongTermSongIds()) safeCacheName(id),
     };
 
     // 非完整缓存（.part/.mime 旁路文件）不参与上限统计
@@ -533,7 +893,7 @@ class StreamCacheService {
         } catch (_) {
           continue;
         }
-        final stem = _stemFromCacheName(name); // 去扩展名
+        final stem = _cacheStemFromName(name);
         if (protected.contains(stem)) continue;
         entries.add(entity);
       }
@@ -544,27 +904,33 @@ class StreamCacheService {
     entries.sort((a, b) {
       int compare(a, b) {
         try {
-          return a.statSync().modified
-              .compareTo(b.statSync().modified);
+          return a.statSync().modified.compareTo(b.statSync().modified);
         } catch (_) {
           return 0;
         }
       }
+
       return compare(a, b);
     });
 
     for (final file in entries) {
       if (total <= limitBytes) break;
-      final stem = _stemFromCacheName(p.basename(file.path));
+      final stem = _cacheStemFromName(p.basename(file.path));
+      final currentProtected = <String>{
+        if (currentSongId != null) safeCacheName(currentSongId!),
+        for (final id in _sources.keys) safeCacheName(id),
+        for (final id in protectedSongIds ?? const <String>{})
+          safeCacheName(id),
+        for (final id in _allLongTermSongIds()) safeCacheName(id),
+      };
+      if (_isProtectedCacheStem(stem, currentProtected)) continue;
       try {
         total -= await file.length();
         await file.delete();
         // 顺带删除 .mime 旁路文件
         final mime = File('${file.path}.mime');
         if (await mime.exists()) await mime.delete();
-        _sources.removeWhere(
-          (id, _) => safeCacheName(id) == stem,
-        );
+        _sources.removeWhere((id, _) => safeCacheName(id) == stem);
       } catch (_) {
         // Windows 打开中的文件删除会失败，静默跳过
       }
@@ -576,6 +942,69 @@ class StreamCacheService {
   static String _stemFromCacheName(String name) {
     final dot = name.lastIndexOf('.');
     return dot > 0 ? name.substring(0, dot) : name;
+  }
+
+  static String _cacheStemFromName(String name) {
+    final stem = _stemFromCacheName(name);
+    if (!stem.startsWith('tc_')) return stem;
+    final withoutPrefix = stem.substring(3);
+    for (final codec in const ['flac', 'mp3', 'opus']) {
+      final suffix = '_$codec';
+      if (withoutPrefix.endsWith(suffix)) {
+        return withoutPrefix.substring(0, withoutPrefix.length - suffix.length);
+      }
+    }
+    return stem;
+  }
+
+  static bool _isProtectedCacheStem(String stem, Set<String> protected) {
+    return protected.contains(stem);
+  }
+
+  bool _isCacheStemCurrentlyProtected(String stem, int cutoff) {
+    if (currentSongId != null && safeCacheName(currentSongId!) == stem) {
+      return true;
+    }
+    if (_sources.keys.any((id) => safeCacheName(id) == stem)) return true;
+    if (_allLongTermSongIds().any((id) => safeCacheName(id) == stem)) {
+      return true;
+    }
+    return _transientTouchedAt.entries.any(
+      (entry) => safeCacheName(entry.key) == stem && entry.value >= cutoff,
+    );
+  }
+
+  Future<void> _cleanupUntrackedExpiredFiles(int cutoff) async {
+    final dir = _dir;
+    if (dir == null) return;
+    final trackedStems = <String>{
+      for (final id in _transientTouchedAt.keys) safeCacheName(id),
+    };
+    final protected = <String>{
+      if (currentSongId != null) safeCacheName(currentSongId!),
+      for (final id in _sources.keys) safeCacheName(id),
+      for (final id in _allLongTermSongIds()) safeCacheName(id),
+    };
+    try {
+      await for (final entity in dir.list(followLinks: false)) {
+        if (entity is! File) continue;
+        final name = p.basename(entity.path);
+        if (name.endsWith('.part') || name.endsWith('.mime')) continue;
+        final stem = _cacheStemFromName(name);
+        if (trackedStems.contains(stem) ||
+            _isProtectedCacheStem(stem, protected)) {
+          continue;
+        }
+        try {
+          final stat = await entity.stat();
+          if (stat.modified.millisecondsSinceEpoch >= cutoff) continue;
+          if (_isCacheStemCurrentlyProtected(stem, cutoff)) continue;
+          await entity.delete();
+          final mime = File('${entity.path}.mime');
+          if (await mime.exists()) await mime.delete();
+        } catch (_) {}
+      }
+    } catch (_) {}
   }
 
   void _onLimitChanged() {

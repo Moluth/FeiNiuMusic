@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../../state/settings_fn_state.dart';
 import '../../utils/cache_version_store.dart';
 import '../../utils/page_cache_store.dart';
+import '../audio/stream_cache_service.dart';
 import '../db/dao/song_dao.dart';
 import '../player_service.dart';
 import 'account_entry.dart';
@@ -258,7 +259,8 @@ class AccountStore {
           final winner = groups
               .expand((g) => g)
               .firstWhere(
-                (g) => !removeIds.contains(g.id) &&
+                (g) =>
+                    !removeIds.contains(g.id) &&
                     g.fnId == e.fnId &&
                     g.username == e.username,
               );
@@ -272,7 +274,9 @@ class AccountStore {
     accounts.value = nextList;
     await _persist();
     if (kDebugMode) {
-      debugPrint('[AccountStore] merged ${removeIds.length} duplicate FNID account(s)');
+      debugPrint(
+        '[AccountStore] merged ${removeIds.length} duplicate FNID account(s)',
+      );
     }
   }
 
@@ -285,9 +289,7 @@ class AccountStore {
   /// 返回规范化后的条目。
   Future<AccountEntry> addOrUpdate(AccountEntry entry) async {
     final list = List<AccountEntry>.from(accounts.value);
-    final index = list.indexWhere(
-      (e) => e.identityKey == entry.identityKey,
-    );
+    final index = list.indexWhere((e) => e.identityKey == entry.identityKey);
     AccountEntry canonical;
     if (index >= 0) {
       final existing = list[index];
@@ -389,6 +391,15 @@ class AccountStore {
       }
     }
     await _persist();
+    try {
+      await StreamCacheService.instance.removeLongTermOwnersWithPrefix(
+        StreamCacheService.accountRetentionOwnerPrefix(id),
+      );
+    } catch (error) {
+      if (kDebugMode) {
+        debugPrint('[AccountStore] remove cache owners failed: $error');
+      }
+    }
   }
 
   /// 登录成功后捕获账号并入列表（供登录页调用）。
@@ -515,7 +526,11 @@ class AccountStore {
   Future<void> activate(AccountEntry entry) async {
     final api = FeiNiuApiClient.instance;
     if (entry.token.isNotEmpty) {
-      await api.setAuth(entry.serverUrl, entry.token, relayMode: entry.relayMode);
+      await api.setAuth(
+        entry.serverUrl,
+        entry.token,
+        relayMode: entry.relayMode,
+      );
     } else {
       await api.clearAuth();
       await api.setBaseUrl(entry.serverUrl);
@@ -697,7 +712,9 @@ class AccountStore {
     if (_switching) return false;
 
     // 1) 尝试用保存的密码静默重登（与 switchTo 的自动登录一致）
-    if (current.token.isNotEmpty && current.password != null && current.password!.isNotEmpty) {
+    if (current.token.isNotEmpty &&
+        current.password != null &&
+        current.password!.isNotEmpty) {
       try {
         final deviceId = AuthService.instance.getOrCreateDeviceId();
         await api.setBaseUrl(current.serverUrl);
@@ -780,10 +797,7 @@ class AccountStore {
   /// 为新增账号生成唯一自动名（默认「飞牛音乐」，重名追加 " (2)"）。
   static String _uniqueAutoName(List<AccountEntry> list, AccountEntry entry) {
     final base = entry.displayName;
-    final used = list
-        .map((e) => e.name)
-        .where((n) => n.isNotEmpty)
-        .toSet();
+    final used = list.map((e) => e.name).where((n) => n.isNotEmpty).toSet();
     if (!used.contains(base)) return base;
     var i = 2;
     while (used.contains('$base ($i)')) {
