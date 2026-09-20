@@ -125,6 +125,16 @@ class PlayerService with WidgetsBindingObserver {
   /// 防止坏源无限重建。
   bool _engineRebuiltForThisStreak = false;
 
+  /// 需要在曲目末尾停住的临时页面计数（例如歌词精校）。
+  ///
+  /// 使用计数而非 bool，避免页面快速进出或嵌套调用时过早恢复自动切歌。
+  int _completionHoldCount = 0;
+  String? _completionHoldSongId;
+  Timer? _completionHoldEndTimer;
+  bool _stoppingAtCompletionHold = false;
+  static const Duration _completionHoldSafetyLead = Duration(milliseconds: 150);
+  static const Duration _completionHoldScheduleWindow = Duration(seconds: 2);
+
   /// 判定「歌曲确实在播」的位置阈值：位置推进超过它才算真实播放
   /// （用于区分 mpv「加载失败也报 completed」与真正播完）。
   static const Duration _playedThreshold = Duration(seconds: 1);
@@ -603,6 +613,7 @@ class PlayerService with WidgetsBindingObserver {
         _engineRebuiltForThisStreak = false;
       }
       position.value = value;
+      _updateCompletionHoldTimer(engine, value);
       _maybePrefetchByRemaining(value);
       _emitSnapshot();
     });
@@ -621,6 +632,7 @@ class PlayerService with WidgetsBindingObserver {
           ? Duration(milliseconds: song.durationMs!)
           : value;
       duration.value = effective;
+      _updateCompletionHoldTimer(engine, position.value);
       final ms = effective?.inMilliseconds ?? 0;
       if (song != null && ms > 0) {
         _maybePersistPlaybackDuration(song, ms);
@@ -649,6 +661,10 @@ class PlayerService with WidgetsBindingObserver {
       if (loading != isLoading.value) {
         isLoading.value = loading;
       }
+      if (!state.playing || loading) {
+        _completionHoldEndTimer?.cancel();
+        _completionHoldEndTimer = null;
+      }
       _emitSnapshot(force: true);
       if (wasPlaying && !state.playing) {
         _schedulePersistPlaybackState(immediate: true);
@@ -656,9 +672,12 @@ class PlayerService with WidgetsBindingObserver {
       // 顺序模式/漫游：当前曲目播完且队列没有可播的下一首时自动追加。
       // 引擎 run 不自动回卷，completed 统一由 _handleEngineCompleted 驱动前进。
       if (state.processingState == EngineProcessingState.completed &&
-          _pendingSelectionSongId == null &&
-          playbackMode.value != PlaybackMode.single) {
-        unawaited(_handleEngineCompleted(engine));
+          _pendingSelectionSongId == null) {
+        if (_completionHoldCount > 0) {
+          isPlaying.value = false;
+        } else if (playbackMode.value != PlaybackMode.single) {
+          unawaited(_handleEngineCompleted(engine));
+        }
       }
       // 无损大文件（media_kit 直连原始流）对网络要求高：缓冲超时提示网络缓慢。
       // 仅当前激活的 media_kit 引擎 + 缓冲态持续超过阈值时提示一次（去重）。
@@ -1253,7 +1272,7 @@ class PlayerService with WidgetsBindingObserver {
       }
     }
     await target.setLoopMode(
-      playbackMode.value == PlaybackMode.single
+      _completionHoldCount > 0 || playbackMode.value == PlaybackMode.single
           ? EngineLoopMode.single
           : EngineLoopMode.none,
     );
@@ -3181,6 +3200,100 @@ class PlayerService with WidgetsBindingObserver {
     }
   }
 
+  /// 临时让当前歌曲播放结束后暂停，不自动切换或单曲循环。
+  Future<void> acquireCompletionHold() async {
+    await _initFuture;
+    _completionHoldCount++;
+    if (_completionHoldCount == 1) {
+      _completionHoldSongId = currentSong.value?.id;
+      await _activeEngine.setLoopMode(EngineLoopMode.single);
+      _updateCompletionHoldTimer(_activeEngine, position.value);
+    }
+  }
+
+  /// 释放播放结束暂停作用域，并恢复用户当前的播放模式。
+  Future<void> releaseCompletionHold() async {
+    await _initFuture;
+    if (_completionHoldCount == 0) return;
+    _completionHoldCount--;
+    if (_completionHoldCount == 0) {
+      _completionHoldEndTimer?.cancel();
+      _completionHoldEndTimer = null;
+      _completionHoldSongId = null;
+      await _applyPlaybackMode(playbackMode.value);
+    }
+  }
+
+  void _updateCompletionHoldTimer(
+    PlayerEngine engine,
+    Duration currentPosition,
+  ) {
+    _completionHoldEndTimer?.cancel();
+    _completionHoldEndTimer = null;
+    final total = duration.value;
+    if (_completionHoldCount == 0 ||
+        _stoppingAtCompletionHold ||
+        !identical(engine, _activeEngine) ||
+        !engine.playing ||
+        isLoading.value ||
+        total == null ||
+        total <= Duration.zero ||
+        currentSong.value?.id != _completionHoldSongId) {
+      return;
+    }
+    final remaining = total - currentPosition;
+    if (remaining > _completionHoldScheduleWindow) return;
+    final speedValue = speed.value <= 0 ? 1.0 : speed.value;
+    final delayMs = max(
+      0,
+      (remaining.inMilliseconds / speedValue).round() -
+          _completionHoldSafetyLead.inMilliseconds,
+    );
+    _completionHoldEndTimer = Timer(
+      Duration(milliseconds: delayMs),
+      () => unawaited(_stopAtCompletionHold(engine)),
+    );
+  }
+
+  Future<void> _stopAtCompletionHold(PlayerEngine engine) async {
+    _completionHoldEndTimer = null;
+    final total = duration.value;
+    if (_completionHoldCount == 0 ||
+        _stoppingAtCompletionHold ||
+        !identical(engine, _activeEngine) ||
+        currentSong.value?.id != _completionHoldSongId ||
+        total == null) {
+      return;
+    }
+    if (isLoading.value) return;
+    final remaining = total - position.value;
+    if (remaining > const Duration(milliseconds: 300)) {
+      _updateCompletionHoldTimer(engine, position.value);
+      return;
+    }
+    _stoppingAtCompletionHold = true;
+    try {
+      await _pausePlayback();
+      if (_completionHoldCount == 0 ||
+          !identical(engine, _activeEngine) ||
+          currentSong.value?.id != _completionHoldSongId) {
+        return;
+      }
+      await engine.seek(
+        Duration(milliseconds: max(0, total.inMilliseconds - 1)),
+      );
+      position.value = total;
+      isPlaying.value = false;
+      _emitSnapshot(force: true);
+    } catch (error) {
+      if (kDebugMode) {
+        debugPrint('stop at completion hold failed: $error');
+      }
+    } finally {
+      _stoppingAtCompletionHold = false;
+    }
+  }
+
   /// 设置播放速度倍率。值先持久化（吸附到档位），再应用到当前引擎；
   /// 引擎异步失败不影响 UI 状态。
   Future<void> setSpeed(double speed) async {
@@ -3924,7 +4037,7 @@ class PlayerService with WidgetsBindingObserver {
   Future<void> _applyPlaybackMode(PlaybackMode mode) async {
     // 双引擎架构下 run 不自动回卷：loop 用 none（逻辑层驱动回卷），
     // single 用 single（引擎重复当前曲）。shuffle 也用 none（播完逻辑层补链）。
-    final engineMode = mode == PlaybackMode.single
+    final engineMode = _completionHoldCount > 0 || mode == PlaybackMode.single
         ? EngineLoopMode.single
         : EngineLoopMode.none;
     await _activeEngine.setLoopMode(engineMode);

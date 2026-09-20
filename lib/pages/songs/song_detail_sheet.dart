@@ -17,6 +17,7 @@ import '../../components/common/app_list_tile.dart';
 import '../../components/feedback/app_toast.dart';
 import '../library/library_detail_pages.dart';
 import '../library/playlists_page.dart';
+import '../player/lyrics/lyric_fine_tune_page.dart';
 import 'song_edit_page.dart';
 
 class SongDetailSheet extends StatefulWidget {
@@ -323,6 +324,18 @@ class _SongDetailSheetState extends State<SongDetailSheet> {
                 }
               },
             ),
+            if (widget.showPlayerControls)
+              AppListTile(
+                leading: const Icon(Icons.lyrics_outlined),
+                title: '歌词精校',
+                onTap: () {
+                  final nav = Navigator.of(context);
+                  nav.pop();
+                  nav.push(
+                    buildAppPageRoute((_) => LyricFineTunePage(song: _song)),
+                  );
+                },
+              ),
             if (widget.showPlayerControls)
               AppListTile(
                 leading: const Icon(Icons.refresh_rounded),
