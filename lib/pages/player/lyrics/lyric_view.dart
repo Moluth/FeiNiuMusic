@@ -543,7 +543,7 @@ class _PlayerLyricsViewState extends State<PlayerLyricsView> with SignalsMixin {
         final lineGap = rawLineGap * fontSizeScale;
         final snap = lyrics.snapshotSignal.value;
         final isPlaying = player.isPlayingSignal.value;
-        final model = lyrics.lyricModelSignal.value;
+        final model = snap.model;
         final selecting = lyrics.isSelectingSignal.value;
         final centered = _selectionCentered.value;
         final index = lyrics.selectedIndexSignal.value;

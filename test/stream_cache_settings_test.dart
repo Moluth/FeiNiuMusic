@@ -433,7 +433,15 @@ void main() {
         now: DateTime.now().add(const Duration(days: 9)),
       );
 
-      expect(removed.existsSync(), isTrue);
+      expect(removed.existsSync(), isFalse);
+      expect(
+        File(
+          '${tmp.path}${Platform.pathSeparator}'
+          '${StreamCacheService.persistentDirName}${Platform.pathSeparator}'
+          '${StreamCacheService.safeCacheName('removed')}.mp3',
+        ).existsSync(),
+        isTrue,
+      );
     });
 
     test('favorite and playlist owners protect long-term cache', () async {
@@ -467,8 +475,110 @@ void main() {
 
       await StreamCacheService.instance.cleanupExpiredTransientCache(now: now);
 
-      expect(favorite.existsSync(), isTrue);
-      expect(playlist.existsSync(), isTrue);
+      expect(favorite.existsSync(), isFalse);
+      expect(playlist.existsSync(), isFalse);
+      final persistentDir = Directory(
+        '${tmp.path}${Platform.pathSeparator}'
+        '${StreamCacheService.persistentDirName}',
+      );
+      expect(
+        File(
+          '${persistentDir.path}${Platform.pathSeparator}'
+          '${StreamCacheService.safeCacheName('favorite')}.flac',
+        ).existsSync(),
+        isTrue,
+      );
+      expect(
+        File(
+          '${persistentDir.path}${Platform.pathSeparator}'
+          '${StreamCacheService.safeCacheName('playlist')}.mp3',
+        ).existsSync(),
+        isTrue,
+      );
+    });
+
+    test(
+      'long-term owner moves an existing cache to persistent storage',
+      () async {
+        final tmp = await Directory.systemTemp.createTemp('stream_cache_test_');
+        addTearDown(() => tmp.delete(recursive: true));
+        await StreamCacheService.instance.setDirectoryForTest(tmp);
+        final transient = File(
+          '${tmp.path}${Platform.pathSeparator}'
+          '${StreamCacheService.safeCacheName('favorite')}.flac',
+        );
+        await transient.writeAsBytes([1, 2, 3]);
+
+        await StreamCacheService.instance.setLongTermOwnerSongs(
+          StreamCacheService.favoriteRetentionOwner,
+          ['favorite'],
+        );
+
+        final persistent = File(
+          '${tmp.path}${Platform.pathSeparator}'
+          '${StreamCacheService.persistentDirName}${Platform.pathSeparator}'
+          '${StreamCacheService.safeCacheName('favorite')}.flac',
+        );
+        expect(transient.existsSync(), isFalse);
+        expect(persistent.existsSync(), isTrue);
+        final found = await StreamCacheService.instance.completeFileFor(
+          'favorite',
+          song: _song('favorite', format: 'flac'),
+        );
+        expect(found?.path, persistent.path);
+      },
+    );
+
+    test('persistent cache is not deleted by transient expiration', () async {
+      final tmp = await Directory.systemTemp.createTemp('stream_cache_test_');
+      addTearDown(() => tmp.delete(recursive: true));
+      await StreamCacheService.instance.setDirectoryForTest(tmp);
+      final persistentDir = Directory(
+        '${tmp.path}${Platform.pathSeparator}'
+        '${StreamCacheService.persistentDirName}',
+      );
+      final persistent = File(
+        '${persistentDir.path}${Platform.pathSeparator}'
+        '${StreamCacheService.safeCacheName('kept')}.mp3',
+      );
+      await persistent.writeAsBytes([1]);
+      final now = DateTime.utc(2026, 9, 14, 12);
+      await persistent.setLastModified(now.subtract(const Duration(days: 30)));
+      await StreamCacheService.instance.markTransientUsed(
+        'kept',
+        usedAt: now.subtract(const Duration(days: 30)),
+      );
+
+      await StreamCacheService.instance.cleanupExpiredTransientCache(now: now);
+
+      expect(persistent.existsSync(), isTrue);
+      expect(
+        await StreamCacheService.instance.completeFileFor(
+          'kept',
+          song: _song('kept', format: 'mp3'),
+        ),
+        isNotNull,
+      );
+    });
+
+    test('long-term song downloads directly to persistent storage', () async {
+      final tmp = await Directory.systemTemp.createTemp('stream_cache_test_');
+      addTearDown(() => tmp.delete(recursive: true));
+      await StreamCacheService.instance.setDirectoryForTest(tmp);
+      await StreamCacheService.instance.setLongTermOwnerSongs(
+        StreamCacheService.playlistRetentionOwner('playlist-a'),
+        ['playlist-song'],
+      );
+
+      final source = await StreamCacheService.instance.sourceForSong(
+        _song('playlist-song', format: 'mp3'),
+      );
+
+      expect(
+        source.cacheFile.parent.path,
+        '${tmp.path}${Platform.pathSeparator}'
+        '${StreamCacheService.persistentDirName}',
+      );
     });
 
     test('account-scoped owners do not collide', () {
@@ -490,31 +600,42 @@ void main() {
       );
     });
 
-    test('playlist owner protects transcoded cache during eviction', () async {
-      final tmp = await Directory.systemTemp.createTemp('stream_cache_test_');
-      addTearDown(() => tmp.delete(recursive: true));
-      await StreamCacheService.instance.setDirectoryForTest(tmp);
-      AppCacheSettings.cacheLimitMb.value = 1;
-      final protected = File(
-        '${tmp.path}${Platform.pathSeparator}'
-        'tc_${StreamCacheService.safeCacheName('favorite')}_flac.mp4',
-      );
-      final disposable = File(
-        '${tmp.path}${Platform.pathSeparator}'
-        '${StreamCacheService.safeCacheName('disposable')}.mp3',
-      );
-      await protected.writeAsBytes(List<int>.filled(700 * 1024, 1));
-      await disposable.writeAsBytes(List<int>.filled(700 * 1024, 2));
-      await StreamCacheService.instance.setLongTermOwnerSongs(
-        StreamCacheService.playlistRetentionOwner('playlist-a'),
-        ['favorite'],
-      );
+    test(
+      'playlist owner moves transcoded cache out of eviction pool',
+      () async {
+        final tmp = await Directory.systemTemp.createTemp('stream_cache_test_');
+        addTearDown(() => tmp.delete(recursive: true));
+        await StreamCacheService.instance.setDirectoryForTest(tmp);
+        AppCacheSettings.cacheLimitMb.value = 1;
+        final protected = File(
+          '${tmp.path}${Platform.pathSeparator}'
+          'tc_${StreamCacheService.safeCacheName('favorite')}_flac.mp4',
+        );
+        final disposable = File(
+          '${tmp.path}${Platform.pathSeparator}'
+          '${StreamCacheService.safeCacheName('disposable')}.mp3',
+        );
+        await protected.writeAsBytes(List<int>.filled(700 * 1024, 1));
+        await disposable.writeAsBytes(List<int>.filled(700 * 1024, 2));
+        await StreamCacheService.instance.setLongTermOwnerSongs(
+          StreamCacheService.playlistRetentionOwner('playlist-a'),
+          ['favorite'],
+        );
 
-      await StreamCacheService.instance.evictIfNeeded();
+        await StreamCacheService.instance.evictIfNeeded();
 
-      expect(protected.existsSync(), isTrue);
-      expect(disposable.existsSync(), isFalse);
-    });
+        expect(protected.existsSync(), isFalse);
+        expect(
+          File(
+            '${tmp.path}${Platform.pathSeparator}'
+            '${StreamCacheService.persistentDirName}${Platform.pathSeparator}'
+            '${protected.uri.pathSegments.last}',
+          ).existsSync(),
+          isTrue,
+        );
+        expect(disposable.existsSync(), isTrue);
+      },
+    );
   });
 
   group('旧缓存目录一次性清理', () {

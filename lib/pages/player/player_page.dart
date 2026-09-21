@@ -763,7 +763,7 @@ class _PosterLyricsPreview extends StatelessWidget {
       builder: (context) {
         final lyrics = LyricsService.instance;
         final snap = lyrics.snapshotSignal.value;
-        final model = lyrics.lyricModelSignal.value;
+        final model = snap.model;
         final lines = model?.lines ?? const <LyricLine>[];
         // No skeleton: keep blank while loading a new song's lyrics, show the
         // real lines as soon as they arrive.

@@ -13,11 +13,11 @@ import '../../state/settings_cache_state.dart';
 import '../../state/song_state.dart';
 import 'cache_source.dart';
 
-/// 音频流缓存管理器 —— 注册表 + 上限淘汰
+/// 音频流缓存管理器 —— 临时缓存 + 长期缓存 + 注册表 + 上限淘汰
 ///
-/// - 缓存目录：`getTemporaryDirectory()/stream_cache/`（系统标准缓存目录，系统
-///   空间不足时可自动清理）。迁移自旧的 `getApplicationSupportDirectory()/stream_cache/`
-///   （app 私有目录，系统不会清）。首次进入新目录时把旧目录一次性清理掉。
+/// - 普通歌曲：`getTemporaryDirectory()/stream_cache/`，保留 10 天并受容量上限约束。
+/// - 收藏/歌单歌曲：`getApplicationSupportDirectory()/stream_cache_persistent_v1/`，
+///   不参与自动过期和容量淘汰，只在用户明确清空缓存时删除。
 /// - 注册表 `Map<songId, StreamAudioCacheSource>`：播放器与预缓存器**共享同一实例**，
 ///   保证每个缓存文件只有一个下载循环。
 /// - 淘汰：总量超限时按 mtime 删最旧**完整文件**，直到 ≤ 上限。保护当前播放歌曲与
@@ -27,6 +27,7 @@ class StreamCacheService {
 
   /// 当前使用的缓存目录名（位于系统缓存目录下）。
   static const String dirName = 'stream_cache';
+  static const String persistentDirName = 'stream_cache_persistent_v1';
 
   /// 旧版缓存目录名（位于 app-support 目录下）。升级后首次运行清理一次，
   /// 由 [_prefsLegacyCleanupDone] 标记去重，只清一次。
@@ -66,7 +67,9 @@ class StreamCacheService {
   final Map<String, Set<String>> _longTermOwners = {};
   final Map<String, int> _transientTouchedAt = {};
   Directory? _dir;
+  Directory? _persistentDir;
   Future<void>? _initFuture;
+  Future<void>? _persistentInitFuture;
   Future<void>? _retentionLoadFuture;
   Future<void> _retentionMutationChain = Future<void>.value();
   Future<void> _retentionWriteChain = Future<void>.value();
@@ -122,12 +125,39 @@ class StreamCacheService {
     return _dir!;
   }
 
+  Future<Directory> _resolvePersistentDir() async {
+    final existing = _persistentDir;
+    if (existing != null) return existing;
+    final inFlight = _persistentInitFuture;
+    if (inFlight != null) {
+      await inFlight;
+      return _persistentDir!;
+    }
+    final future = () async {
+      final support = await getApplicationSupportDirectory();
+      final dir = Directory(p.join(support.path, persistentDirName));
+      if (!await dir.exists()) await dir.create(recursive: true);
+      _persistentDir = dir;
+    }();
+    _persistentInitFuture = future;
+    await future;
+    return _persistentDir!;
+  }
+
   /// 测试用：注入缓存目录，跳过 getApplicationSupportDirectory 插件调用
   @visibleForTesting
-  Future<void> setDirectoryForTest(Directory dir) async {
+  Future<void> setDirectoryForTest(
+    Directory dir, {
+    Directory? persistentDirectory,
+  }) async {
     if (!await dir.exists()) await dir.create(recursive: true);
+    final persistent =
+        persistentDirectory ?? Directory(p.join(dir.path, persistentDirName));
+    if (!await persistent.exists()) await persistent.create(recursive: true);
     _dir = dir;
+    _persistentDir = persistent;
     _initFuture = Future<void>.value();
+    _persistentInitFuture = Future<void>.value();
   }
 
   @visibleForTesting
@@ -140,7 +170,9 @@ class StreamCacheService {
     _longTermOwners.clear();
     _transientTouchedAt.clear();
     _dir = null;
+    _persistentDir = null;
     _initFuture = null;
+    _persistentInitFuture = null;
     _retentionLoadFuture = null;
     _retentionMutationChain = Future<void>.value();
     _retentionWriteChain = Future<void>.value();
@@ -183,6 +215,7 @@ class StreamCacheService {
       _longTermOwners.remove(owner);
     }
     await _persistRetentionPolicy();
+    await _promoteSongsToPersistent(ids);
   }
 
   Future<void> removeLongTermOwnerSongs(
@@ -362,6 +395,7 @@ class StreamCacheService {
       _longTermOwners.clear();
       _transientTouchedAt.clear();
     }
+    await _promoteSongsToPersistent(_allLongTermSongIds());
   }
 
   Future<void> _persistRetentionPolicy() async {
@@ -391,6 +425,54 @@ class StreamCacheService {
       }
     }
     return false;
+  }
+
+  Future<void> _promoteSongsToPersistent(Iterable<String> songIds) async {
+    final ids = songIds.where((id) => id.isNotEmpty).toSet();
+    if (ids.isEmpty) return;
+    final transientDir = await _resolveDir();
+    final persistentDir = await _resolvePersistentDir();
+    final protectedStems = {for (final id in ids) safeCacheName(id)};
+    try {
+      await for (final entity in transientDir.list(followLinks: false)) {
+        if (entity is! File) continue;
+        final name = p.basename(entity.path);
+        if (name.endsWith('.part') || name.endsWith('.mime')) continue;
+        final stem = _cacheStemFromName(name);
+        if (!protectedStems.contains(stem)) continue;
+        await _moveFileToDirectory(entity, persistentDir);
+        final mime = File('${entity.path}.mime');
+        if (await mime.exists()) {
+          await _moveFileToDirectory(mime, persistentDir);
+        }
+      }
+    } catch (_) {
+      // 持久化失败时保留临时文件，播放仍可继续；下次 owner 同步或启动会重试。
+    }
+  }
+
+  Future<void> _moveFileToDirectory(File source, Directory targetDir) async {
+    final target = File(p.join(targetDir.path, p.basename(source.path)));
+    if (await target.exists()) {
+      if (await source.exists()) await source.delete();
+      return;
+    }
+    try {
+      await source.rename(target.path);
+    } on FileSystemException {
+      final staging = File('${target.path}.migrate.part');
+      try {
+        if (await staging.exists()) await staging.delete();
+        await source.copy(staging.path);
+        await staging.rename(target.path);
+        if (await source.exists()) await source.delete();
+      } catch (_) {
+        try {
+          if (await staging.exists()) await staging.delete();
+        } catch (_) {}
+        rethrow;
+      }
+    }
   }
 
   /// 净化 songId 为合法文件名片段
@@ -480,26 +562,49 @@ class StreamCacheService {
   Future<String> _extensionFromMime(String songId) async {
     try {
       await _resolveDir();
-      final mimeFile = File('${_cacheFileBaseFor(songId)}.mime');
-      if (await mimeFile.exists()) {
-        final mime = await mimeFile.readAsString();
-        final ext = _extensionForMime(mime);
-        if (ext != null) return ext;
+      await _resolvePersistentDir();
+      for (final dir in [_persistentDir!, _dir!]) {
+        final mimeFile = File('${_cacheFileBaseFor(songId, dir: dir)}.mime');
+        if (await mimeFile.exists()) {
+          final mime = await mimeFile.readAsString();
+          final ext = _extensionForMime(mime);
+          if (ext != null) return ext;
+        }
       }
     } catch (_) {}
     return defaultExtension;
   }
 
   /// 缓存文件主名（`${safeCacheName}.<ext>`）。
-  File _cacheFileFor(String songId, String ext) {
-    final base = _dir?.path ?? '';
+  File _cacheFileFor(String songId, String ext, {Directory? dir}) {
+    final base = dir?.path ?? _dir?.path ?? '';
     return File(p.join(base, '${safeCacheName(songId)}.$ext'));
   }
 
   /// 无后缀的基础路径（用于 .part/.mime 等旁路文件）。
-  String _cacheFileBaseFor(String songId) {
-    final base = _dir?.path ?? '';
+  String _cacheFileBaseFor(String songId, {Directory? dir}) {
+    final base = dir?.path ?? _dir?.path ?? '';
     return p.join(base, '${safeCacheName(songId)}.mp3');
+  }
+
+  Future<File?> _completeFileIn(
+    Directory dir,
+    String songId, {
+    String? preferredExtension,
+  }) async {
+    if (preferredExtension != null) {
+      final preferred = _cacheFileFor(songId, preferredExtension, dir: dir);
+      if (await preferred.exists()) return preferred;
+    }
+    for (final candidateExtension in _knownCacheExtensions) {
+      if (candidateExtension == preferredExtension) continue;
+      final candidate = _cacheFileFor(songId, candidateExtension, dir: dir);
+      if (await candidate.exists()) {
+        _formatExtensions[songId] = candidateExtension;
+        return candidate;
+      }
+    }
+    return null;
   }
 
   /// 完整缓存文件（存在则返回，供播放走 `AudioSource.file` 秒播）。
@@ -518,32 +623,32 @@ class StreamCacheService {
   }) async {
     if (!isEnabled) return null;
     await _resolveDir();
+    await _resolvePersistentDir();
 
     final localExtension =
         ext ?? (song == null ? null : extensionForSongSync(song));
-    if (localExtension != null) {
-      final local = _cacheFileFor(songId, localExtension);
-      if (await local.exists()) return local;
-    }
-
-    // 格式未知时直接探测现有文件，不调用 /track/metadata。缓存命中的播放
-    // 路径必须完全离线可用，不能为了确认扩展名反过来等待服务器。
-    for (final candidateExtension in _knownCacheExtensions) {
-      if (candidateExtension == localExtension) continue;
-      final candidate = _cacheFileFor(songId, candidateExtension);
-      if (await candidate.exists()) {
-        _formatExtensions[songId] = candidateExtension;
-        return candidate;
-      }
-    }
+    final persistent = await _completeFileIn(
+      _persistentDir!,
+      songId,
+      preferredExtension: localExtension,
+    );
+    if (persistent != null) return persistent;
+    final transient = await _completeFileIn(
+      _dir!,
+      songId,
+      preferredExtension: localExtension,
+    );
+    if (transient != null) return transient;
 
     if (!allowMetadataLookup || song == null) return null;
     final resolved = await extensionForSong(song);
-    final resolvedFile = _cacheFileFor(songId, resolved);
-    if (await resolvedFile.exists()) return resolvedFile;
-    if (resolved != defaultExtension) {
-      final legacy = _cacheFileFor(songId, defaultExtension);
-      if (await legacy.exists()) return legacy;
+    for (final dir in [_persistentDir!, _dir!]) {
+      final resolvedFile = _cacheFileFor(songId, resolved, dir: dir);
+      if (await resolvedFile.exists()) return resolvedFile;
+      if (resolved != defaultExtension) {
+        final legacy = _cacheFileFor(songId, defaultExtension, dir: dir);
+        if (await legacy.exists()) return legacy;
+      }
     }
     return null;
   }
@@ -567,8 +672,8 @@ class StreamCacheService {
   ///
   /// 与原始流缓存（`<safeId>.<ext>`）区分；带 codec，flac/mp3 转码是两个
   /// 不同文件，不会串。
-  String _transcodeFileBase(String songId, String codec) {
-    final base = _dir?.path ?? '';
+  String _transcodeFileBase(String songId, String codec, {Directory? dir}) {
+    final base = dir?.path ?? _dir?.path ?? '';
     return p.join(base, 'tc_${safeCacheName(songId)}_$codec');
   }
 
@@ -579,8 +684,11 @@ class StreamCacheService {
   Future<File?> transcodeCompleteFileFor(String songId, String codec) async {
     if (!isEnabled) return null;
     await _resolveDir();
-    final file = File('${_transcodeFileBase(songId, codec)}.mp4');
-    if (await file.exists()) return file;
+    await _resolvePersistentDir();
+    for (final dir in [_persistentDir!, _dir!]) {
+      final file = File('${_transcodeFileBase(songId, codec, dir: dir)}.mp4');
+      if (await file.exists()) return file;
+    }
     return null;
   }
 
@@ -601,7 +709,13 @@ class StreamCacheService {
   ) async {
     try {
       await _ensureDir();
-      final finalFile = File('${_transcodeFileBase(songId, codec)}.mp4');
+      await _ensureRetentionLoaded();
+      final targetDir = _isLongTermSong(songId)
+          ? await _resolvePersistentDir()
+          : _dir!;
+      final finalFile = File(
+        '${_transcodeFileBase(songId, codec, dir: targetDir)}.mp4',
+      );
       if (await finalFile.exists()) return; // 已缓存
       final partFile = File('${finalFile.path}.part');
       final raf = await partFile.open(mode: FileMode.write);
@@ -659,7 +773,11 @@ class StreamCacheService {
     if (existing != null) return existing;
 
     await _ensureDir();
+    await _ensureRetentionLoaded();
     final ext = extensionForSongSync(song) ?? await extensionForSong(song);
+    final targetDir = _isLongTermSong(song.id)
+        ? await _resolvePersistentDir()
+        : _dir!;
     final api = FeiNiuApiClient.instance;
     final streamUrl = api.streamUrl(song.id);
     final authHeaders = FeiNiuApiClient.imageAuthHeaders();
@@ -667,7 +785,7 @@ class StreamCacheService {
       songId: song.id,
       uri: Uri.parse(streamUrl),
       headers: authHeaders,
-      cacheFile: _cacheFileFor(song.id, ext),
+      cacheFile: _cacheFileFor(song.id, ext, dir: targetDir),
       endpointResolver: () async {
         // 网盘音乐可能被 302 到 CDN/内网地址。延迟到该音源真正被读取时才
         // 解析，避免创建大播放队列时逐首等待网络。
@@ -686,8 +804,12 @@ class StreamCacheService {
     return source;
   }
 
-  void _onSourceFinished(String songId) {
+  Future<void> _onSourceFinished(String songId) async {
     _sources.remove(songId);
+    await _ensureRetentionLoaded();
+    if (_isLongTermSong(songId)) {
+      await _promoteSongsToPersistent([songId]);
+    }
     unawaited(evictIfNeeded());
   }
 
@@ -695,29 +817,38 @@ class StreamCacheService {
   Future<void> invalidate(String songId) async {
     await _ensureDir();
     _sources.remove(songId);
-    await _deleteCacheFiles(songId);
+    await _deleteCacheFiles(songId, includePersistent: true);
   }
 
   Future<bool> _deleteCacheFiles(
     String songId, {
     bool Function()? canDelete,
+    bool includePersistent = false,
   }) async {
-    final base = _cacheFileBaseFor(songId);
-    final candidates = <File>[
-      File(base),
-      File('$base.part'),
-      File('$base.mime'),
-    ];
-    // 历史/其它后缀的完整文件也一并清除
-    for (final ext in _knownCacheExtensions) {
-      final f = File(_cacheFileFor(songId, ext).path);
-      if (!candidates.contains(f)) candidates.add(f);
-      candidates
-        ..add(File('${f.path}.part'))
-        ..add(File('${f.path}.mime'));
+    await _resolveDir();
+    final directories = <Directory>[_dir!];
+    if (includePersistent) {
+      directories.add(await _resolvePersistentDir());
     }
-    // 转码缓存（tc_<id>_<codec>.mp4 及其 .part）也一并清除
-    candidates.addAll(await _transcodeFilesFor(songId));
+    final candidates = <File>[];
+    for (final dir in directories) {
+      final base = _cacheFileBaseFor(songId, dir: dir);
+      candidates
+        ..add(File(base))
+        ..add(File('$base.part'))
+        ..add(File('$base.mime'));
+      // 历史/其它后缀的完整文件也一并清除
+      for (final ext in _knownCacheExtensions) {
+        final f = _cacheFileFor(songId, ext, dir: dir);
+        if (!candidates.any((candidate) => candidate.path == f.path)) {
+          candidates.add(f);
+        }
+        candidates
+          ..add(File('${f.path}.part'))
+          ..add(File('${f.path}.mime'));
+      }
+      candidates.addAll(await _transcodeFilesFor(songId, dir: dir));
+    }
     for (final f in candidates) {
       try {
         if (canDelete != null && !canDelete()) return false;
@@ -732,13 +863,12 @@ class StreamCacheService {
   }
 
   /// 某首歌的全部转码缓存文件（`tc_<safeId>_<codec>.mp4` / `.part` / 各 codec）。
-  Future<List<File>> _transcodeFilesFor(String songId) async {
+  Future<List<File>> _transcodeFilesFor(String songId, {Directory? dir}) async {
     final files = <File>[];
     try {
-      await _resolveDir();
-      final dir = _dir!;
+      final targetDir = dir ?? await _resolveDir();
       final prefix = 'tc_${safeCacheName(songId)}_';
-      await for (final entity in dir.list(followLinks: false)) {
+      await for (final entity in targetDir.list(followLinks: false)) {
         if (entity is! File) continue;
         final name = p.basename(entity.path);
         if (name.startsWith(prefix)) files.add(entity);
@@ -1062,9 +1192,12 @@ class StreamCacheService {
   Future<int> totalSize() async {
     try {
       await _ensureDir();
+      await _resolvePersistentDir();
       int total = 0;
-      await for (final f in _dir!.list(recursive: true, followLinks: false)) {
-        if (f is File) total += await f.length();
+      for (final dir in [_dir!, _persistentDir!]) {
+        await for (final f in dir.list(followLinks: false)) {
+          if (f is File) total += await f.length();
+        }
       }
       return total;
     } catch (_) {
@@ -1076,11 +1209,14 @@ class StreamCacheService {
   Future<void> clearAll() async {
     try {
       await _ensureDir();
+      await _resolvePersistentDir();
       _sources.clear();
-      await for (final entity in _dir!.list(followLinks: false)) {
-        try {
-          await entity.delete(recursive: true);
-        } catch (_) {}
+      for (final dir in [_dir!, _persistentDir!]) {
+        await for (final entity in dir.list(followLinks: false)) {
+          try {
+            await entity.delete(recursive: true);
+          } catch (_) {}
+        }
       }
     } catch (_) {}
   }

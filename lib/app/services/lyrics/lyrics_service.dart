@@ -26,6 +26,20 @@ bool hasWordLevelLyrics(fl.LyricModel? model) {
   return model?.lines.any((line) => (line.words?.length ?? 0) >= 2) ?? false;
 }
 
+@visibleForTesting
+bool shouldReloadStaleLyricsSearch({
+  required int requestSequence,
+  required int currentSequence,
+  required String? searchedLyrics,
+  required String songId,
+  required String? currentSongId,
+}) {
+  return requestSequence != currentSequence &&
+      searchedLyrics != null &&
+      searchedLyrics.trim().isNotEmpty &&
+      currentSongId == songId;
+}
+
 class LyricsSnapshot {
   final LyricsLoadStatus status;
   final SongEntity? song;
@@ -53,11 +67,12 @@ class LyricsSnapshot {
     SongEntity? song,
     Object? error,
     fl.LyricModel? model,
+    bool clearModel = false,
   }) {
     return LyricsSnapshot(
       status: status ?? this.status,
       song: song ?? this.song,
-      model: model ?? this.model,
+      model: clearModel ? null : (model ?? this.model),
       error: error,
     );
   }
@@ -207,7 +222,7 @@ class LyricsService {
     snapshot.value = snapshot.value.copyWith(
       status: LyricsLoadStatus.loading,
       song: song,
-      model: null,
+      clearModel: true,
       error: null,
     );
     controller.lyricNotifier.value = null;
@@ -217,7 +232,7 @@ class LyricsService {
       snapshot.value = snapshot.value.copyWith(
         status: LyricsLoadStatus.empty,
         song: null,
-        model: null,
+        clearModel: true,
         error: null,
       );
       await _syncLyriconSong(null, null);
@@ -240,14 +255,25 @@ class LyricsService {
         if (LyricAutoSearchSettings.enabled.value &&
             SongMatchService.instance.available) {
           searched = await _searchLyricForSong(song);
-          if (seq != _loadSeq) return;
+          if (seq != _loadSeq) {
+            if (shouldReloadStaleLyricsSearch(
+              requestSequence: seq,
+              currentSequence: _loadSeq,
+              searchedLyrics: searched,
+              songId: song.id,
+              currentSongId: _player.currentSong.value?.id,
+            )) {
+              unawaited(_loadForSong(song));
+            }
+            return;
+          }
         }
 
         if (searched == null || searched.trim().isEmpty) {
           snapshot.value = snapshot.value.copyWith(
             status: LyricsLoadStatus.empty,
             song: song,
-            model: null,
+            clearModel: true,
             error: null,
           );
           await _syncLyriconSong(song, null);
@@ -292,7 +318,7 @@ class LyricsService {
       snapshot.value = snapshot.value.copyWith(
         status: LyricsLoadStatus.failed,
         song: song,
-        model: null,
+        clearModel: true,
         error: e,
       );
       await _syncLyriconSong(song, null);

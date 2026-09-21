@@ -22,6 +22,7 @@ class CoverLocalCache {
   CoverLocalCache._();
 
   static const String kDirName = 'covers_v2';
+  static const String kPersistentDirName = 'covers_persistent_v1';
   static const Duration refreshInterval = Duration(days: 5);
 
   static final DefaultCacheManager _coverCache = DefaultCacheManager();
@@ -31,6 +32,7 @@ class CoverLocalCache {
   static String? lastRefreshedPath;
 
   static String? _dirPath;
+  static String? _persistentDirPath;
   static Future<String>? _applicationId;
 
   static Future<String> coverDirPath() async {
@@ -40,6 +42,15 @@ class CoverLocalCache {
       await io.Directory(_dirPath!).create(recursive: true);
     }
     return _dirPath!;
+  }
+
+  static Future<String> persistentCoverDirPath() async {
+    if (_persistentDirPath == null) {
+      final dir = await getApplicationSupportDirectory();
+      _persistentDirPath = '${dir.path}/$kPersistentDirName';
+      await io.Directory(_persistentDirPath!).create(recursive: true);
+    }
+    return _persistentDirPath!;
   }
 
   /// Returns a URI that Android Auto and other external media clients can
@@ -60,11 +71,34 @@ class CoverLocalCache {
     String coverId, {
     int? updatedAt,
     int size = 120,
+    bool persistent = false,
   }) async {
+    final persistentTarget = await _cacheFileFor(
+      coverId,
+      updatedAt: updatedAt,
+      size: size,
+      persistent: true,
+    );
+    if (await persistentTarget.exists()) {
+      try {
+        final modifiedAt = (await persistentTarget.stat()).modified;
+        if (isCacheFresh(modifiedAt: modifiedAt, now: DateTime.now())) {
+          return persistentTarget.path;
+        }
+      } catch (_) {}
+      final persistentUrl = FeiNiuApiClient.instance.coverUrl(
+        coverId,
+        size: size,
+        updatedAt: updatedAt,
+      );
+      _refreshInBackground(persistentUrl, persistentTarget);
+      return persistentTarget.path;
+    }
     final target = await _cacheFileFor(
       coverId,
       updatedAt: updatedAt,
       size: size,
+      persistent: persistent,
     );
     final url = FeiNiuApiClient.instance.coverUrl(
       coverId,
@@ -239,12 +273,16 @@ class CoverLocalCache {
     String coverId, {
     int? updatedAt,
     int size = 120,
+    bool persistent = false,
   }) async {
     // size 纳入缓存键：同封面不同尺寸（通知 512px vs 悬浮岛 120px）落在
     // 不同文件，避免先写入的小尺寸文件被大尺寸请求复用。
     final cacheKey = '$coverId:${updatedAt ?? 0}:$size';
     final fileName = '${sha1.convert(utf8.encode(cacheKey))}.img';
-    return io.File('${await coverDirPath()}/$fileName');
+    final dir = persistent
+        ? await persistentCoverDirPath()
+        : await coverDirPath();
+    return io.File('$dir/$fileName');
   }
 
   static Future<String?> _copyToCoverCache(

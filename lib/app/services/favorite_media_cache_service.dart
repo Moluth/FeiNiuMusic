@@ -25,6 +25,7 @@ class FavoriteMediaCacheService {
   final Set<String> _queuedIds = <String>{};
 
   Future<void>? _allFavoritesTask;
+  Future<void> _playlistTaskChain = Future<void>.value();
   String? _activeAccountId;
   Timer? _scheduleTimer;
   bool _started = false;
@@ -93,6 +94,42 @@ class FavoriteMediaCacheService {
     }
   }
 
+  /// 在播放器空闲时为已加载的歌单歌曲准备长期音频、封面和歌词缓存。
+  Future<void> cachePlaylistSongs(Iterable<SongEntity> songs) {
+    final pendingSongs = songs.toList(growable: false);
+    if (pendingSongs.isEmpty) return Future<void>.value();
+    final accountId = AccountStore.instance.currentAccountId.value;
+    final baseUrl = _api.baseUrl;
+    final token = _api.token;
+    final next = _playlistTaskChain.catchError((_) {}).then((_) async {
+      if (accountId == null ||
+          accountId.isEmpty ||
+          AccountStore.instance.currentAccountId.value != accountId ||
+          _api.baseUrl != baseUrl ||
+          _api.token != token) {
+        return;
+      }
+      for (final song in pendingSongs) {
+        await _waitForPlaybackIdle();
+        if (AccountStore.instance.currentAccountId.value != accountId ||
+            _api.baseUrl != baseUrl ||
+            _api.token != token) {
+          return;
+        }
+        if (!_queuedIds.add(song.id)) continue;
+        try {
+          await _cacheSong(song);
+        } catch (error) {
+          debugPrint('[PlaylistCache] cache ${song.id} failed: $error');
+        } finally {
+          _queuedIds.remove(song.id);
+        }
+      }
+    });
+    _playlistTaskChain = next.catchError((_) {});
+    return next;
+  }
+
   Future<void> _cacheAllFavorites(String accountId) async {
     try {
       await AppCacheSettings.ensureLoaded();
@@ -146,6 +183,7 @@ class FavoriteMediaCacheService {
           song.coverId!,
           updatedAt: song.updatedAt,
           size: FeiNiuApiClient.coverRequestSize,
+          persistent: true,
         ).then<void>((_) {}),
       _lyrics.loadLrc(song).then<void>((_) {}),
     ]);

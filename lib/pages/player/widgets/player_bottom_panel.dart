@@ -122,7 +122,7 @@ class _MiniLyricsPreviewState extends State<_MiniLyricsPreview>
         }
         final lyrics = LyricsService.instance;
         final snap = lyrics.snapshotSignal.value;
-        final model = lyrics.lyricModelSignal.value;
+        final model = snap.model;
         final lines = model?.lines ?? const <LyricLine>[];
         final alignment = _alignment.value;
         final previewHeight = switch (widget.stylePreset) {

@@ -79,16 +79,23 @@ class CoverArtContentProvider : ContentProvider() {
         if (!FILE_NAME.matches(name)) throw FileNotFoundException("Invalid album art name")
 
         val appContext = context ?: throw FileNotFoundException("Provider is not ready")
-        val root = File(appContext.cacheDir, COVER_DIRECTORY).canonicalFile
-        val target = File(root, name).canonicalFile
-        if (!target.path.startsWith(root.path + File.separator) || !target.isFile) {
-            throw FileNotFoundException("Album art not found")
+        val roots = listOf(
+            File(appContext.filesDir, PERSISTENT_COVER_DIRECTORY),
+            File(appContext.cacheDir, COVER_DIRECTORY),
+        )
+        for (directory in roots) {
+            val root = directory.canonicalFile
+            val target = File(root, name).canonicalFile
+            if (target.path.startsWith(root.path + File.separator) && target.isFile) {
+                return target
+            }
         }
-        return target
+        throw FileNotFoundException("Album art not found")
     }
 
     private companion object {
         const val COVER_DIRECTORY = "covers_v2"
+        const val PERSISTENT_COVER_DIRECTORY = "covers_persistent_v1"
         val FILE_NAME = Regex("^[0-9a-f]{40}\\.img$")
     }
 }

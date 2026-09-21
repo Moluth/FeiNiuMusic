@@ -1,9 +1,13 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 
 import '../audio/stream_cache_service.dart';
+import '../favorite_media_cache_service.dart';
 import 'account_store.dart';
 import 'api_client.dart';
 import 'api_models.dart';
+import 'track_service.dart';
 
 /// 飞牛歌单服务（所有操作通过 API）
 class FeiNiuPlaylistService {
@@ -12,6 +16,7 @@ class FeiNiuPlaylistService {
   static final FeiNiuPlaylistService instance = FeiNiuPlaylistService._();
 
   final FeiNiuApiClient _api = FeiNiuApiClient.instance;
+  final FeiNiuTrackService _trackService = FeiNiuTrackService.instance;
 
   Future<void> _syncOwner(Future<void> update) async {
     try {
@@ -66,6 +71,13 @@ class FeiNiuPlaylistService {
         pageData.list.map((track) => track.guid),
         replace:
             page == 1 && (size < 0 || pageData.list.length >= pageData.total),
+      ),
+    );
+    unawaited(
+      FavoriteMediaCacheService.instance.cachePlaylistSongs(
+        pageData.list.map(
+          (track) => _trackService.trackToSongEntity(track.toJson()),
+        ),
       ),
     );
     return pageData;
