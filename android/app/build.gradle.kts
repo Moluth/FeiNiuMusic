@@ -8,7 +8,7 @@ plugins {
 import java.io.FileInputStream
 import java.util.Properties
 
-// 默认包名（飞牛音乐正式包）。
+// 默认包名（欣悦音乐正式包）。
 val DEFAULT_APP_ID = "com.feiniu.music"
 // CI 汽水音乐兼容包包名：仅用于 GitHub Actions 自动打包（--android-project-arg
 // applicationIdOverride=com.luna.music），本地构建不传入该属性，恒为正式包名。
@@ -40,8 +40,8 @@ android {
         // applicationId：CI 传 applicationIdOverride 时（如 com.luna.music 汽水音乐
         // 兼容包）覆盖为传入值；本地构建恒为正式包名 com.feiniu.music。
         applicationId = appIdOverride ?: DEFAULT_APP_ID
-        // 应用名：正式包与汽水音乐兼容包统一为「飞牛音乐」，不区分命名。
-        manifestPlaceholders["appLabel"] = "飞牛音乐"
+        // 应用名：正式包与汽水音乐兼容包统一为「欣悦音乐」，不区分命名。
+        manifestPlaceholders["appLabel"] = "欣悦音乐"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = 27

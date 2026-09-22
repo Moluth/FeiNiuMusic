@@ -1,7 +1,10 @@
+import 'dart:math';
+
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:feiniu_music/app/services/lyrics/lyrics_repository.dart';
 import 'package:feiniu_music/app/services/player_service.dart';
+import 'package:feiniu_music/app/state/song_state.dart';
 import 'package:feiniu_music/pages/home/favorite_page.dart';
 
 void main() {
@@ -128,6 +131,39 @@ void main() {
         ),
         isFalse,
       );
+    });
+  });
+
+  group('local shuffle queue', () {
+    const songs = [
+      SongEntity(id: 'a', title: 'A', artist: '[]'),
+      SongEntity(id: 'b', title: 'B', artist: '[]'),
+      SongEntity(id: 'c', title: 'C', artist: '[]'),
+      SongEntity(id: 'd', title: 'D', artist: '[]'),
+      SongEntity(id: 'e', title: 'E', artist: '[]'),
+    ];
+
+    test('keeps playback history and only shuffles upcoming songs', () {
+      final shuffled = PlayerService.shuffleQueueAfterCurrent(
+        songs,
+        1,
+        random: Random(7),
+      );
+
+      expect(shuffled.take(2).map((song) => song.id), ['a', 'b']);
+      expect(shuffled.skip(2).map((song) => song.id).toSet(), {'c', 'd', 'e'});
+      expect(songs.map((song) => song.id), ['a', 'b', 'c', 'd', 'e']);
+    });
+
+    test('keeps a queue at its final song unchanged', () {
+      final shuffled = PlayerService.shuffleQueueAfterCurrent(
+        songs,
+        songs.length - 1,
+        random: Random(7),
+      );
+
+      expect(shuffled.map((song) => song.id), ['a', 'b', 'c', 'd', 'e']);
+      expect(identical(shuffled, songs), isFalse);
     });
   });
 }

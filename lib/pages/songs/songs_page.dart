@@ -423,14 +423,15 @@ class _SongsPageState extends State<SongsPage>
   void _playSong(int index) {
     final songs = _songs.value;
     if (songs.isEmpty) return;
+    final loadedPage = _currentPage;
+    final sort = _apiSortParam();
     // 已加载数据不足队列上限时，自动分页拉取后续歌曲填充到上限
     _player.playQueueFilledToLimit(
       songs,
       index,
       fetchMore: (page) async {
-        final sort = _apiSortParam();
         final pageData = await _api.getTrackList(
-          page: _currentPage + page,
+          page: loadedPage + page,
           size: _pageSize,
           sort: sort,
         );

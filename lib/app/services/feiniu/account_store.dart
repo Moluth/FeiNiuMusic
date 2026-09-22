@@ -794,7 +794,7 @@ class AccountStore {
     return u;
   }
 
-  /// 为新增账号生成唯一自动名（默认「飞牛音乐」，重名追加 " (2)"）。
+  /// 为新增账号生成唯一自动名（默认「欣悦音乐」，重名追加 " (2)"）。
   static String _uniqueAutoName(List<AccountEntry> list, AccountEntry entry) {
     final base = entry.displayName;
     final used = list.map((e) => e.name).where((n) => n.isNotEmpty).toSet();

@@ -200,20 +200,23 @@ class _RecentPlaybackPageState extends State<RecentPlaybackPage>
   void _playSong(int index) {
     final songs = _songs.value;
     if (songs.isEmpty) return;
+    final loadedPage = _currentPage;
     // 已加载数据不足队列上限时，自动分页拉取后续历史填充到上限。
     // 搜索激活时过滤后的子集与服务端分页顺序不对应，无法可靠续取，跳过填充。
     _player.playQueueFilledToLimit(
       songs,
       index,
-      fetchMore: _searchQuery.isNotEmpty ? null : _fetchHistoryPage,
+      fetchMore: _searchQuery.isNotEmpty
+          ? null
+          : (page) => _fetchHistoryPage(page, loadedPage),
     );
   }
 
   /// 拉取「已加载页之后」的第 [page] 页历史（供 playQueueFilledToLimit 的
   /// fetchMore 使用，每次只返回一页，填充循环由 PlayerService 驱动）。
-  Future<List<SongEntity>> _fetchHistoryPage(int page) async {
+  Future<List<SongEntity>> _fetchHistoryPage(int page, int loadedPage) async {
     final pageData = await _api.getPlayHistory(
-      page: _currentPage + page,
+      page: loadedPage + page,
       size: _pageSize,
     );
     return pageData.list
@@ -228,12 +231,14 @@ class _RecentPlaybackPageState extends State<RecentPlaybackPage>
       _player.playShuffle(_songs.value);
       return;
     }
+    final intent = _player.beginPlaybackIntent();
     final full = List<SongEntity>.from(_songs.value);
     final cap = AppPlaybackQueueSettings.maxQueueLength.value.clamp(10, 1000);
+    final loadedPage = _currentPage;
     var page = 1;
     while (full.length < cap) {
       final pageData = await _api.getPlayHistory(
-        page: _currentPage + page,
+        page: loadedPage + page,
         size: _pageSize,
       );
       final songs = pageData.list
@@ -243,8 +248,9 @@ class _RecentPlaybackPageState extends State<RecentPlaybackPage>
       full.addAll(songs);
       page++;
     }
+    if (!_player.isPlaybackIntentCurrent(intent)) return;
     if (full.length > cap) full.removeRange(cap, full.length);
-    _player.playShuffle(full);
+    _player.playShuffle(full, intentToken: intent);
   }
 
   /// 长按歌曲 → 弹出与歌曲页同款的长按面板，并附带「移出最近播放」。

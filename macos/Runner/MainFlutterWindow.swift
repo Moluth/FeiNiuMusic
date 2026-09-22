@@ -83,9 +83,9 @@ private final class MacosStatusBarController: NSObject {
   private let statusItem: NSStatusItem
   private let methodChannel: FlutterMethodChannel
   private weak var mainWindow: MainFlutterWindow?
-  private var lastTitle = "飞牛音乐"
+  private var lastTitle = "欣悦音乐"
   private var lastArtist = ""
-  private var displayText = "飞牛音乐"
+  private var displayText = "欣悦音乐"
   private var isPlaying = false
   private var isIdle = true
   private var isStatusItemVisible = true
@@ -104,7 +104,7 @@ private final class MacosStatusBarController: NSObject {
 
     configureStatusItemButton()
     updateStatusItemTitle()
-    statusItem.button?.toolTip = "飞牛音乐"
+    statusItem.button?.toolTip = "欣悦音乐"
     statusItem.menu = buildMenu()
     methodChannel.setMethodCallHandler { [weak self] call, result in
       self?.handle(call: call, result: result)
@@ -125,7 +125,7 @@ private final class MacosStatusBarController: NSObject {
     button.imagePosition = .imageLeading
     button.imageScaling = .scaleProportionallyDown
     button.cell?.lineBreakMode = .byClipping
-    button.setAccessibilityLabel("飞牛音乐")
+    button.setAccessibilityLabel("欣悦音乐")
   }
 
   private func buildMenu() -> NSMenu {
@@ -164,7 +164,7 @@ private final class MacosStatusBarController: NSObject {
     menu.addItem(previousItem)
     menu.addItem(NSMenuItem.separator())
 
-    let quitItem = NSMenuItem(title: "退出 飞牛音乐", action: #selector(quitTapped(_:)), keyEquivalent: "q")
+    let quitItem = NSMenuItem(title: "退出 欣悦音乐", action: #selector(quitTapped(_:)), keyEquivalent: "q")
     quitItem.target = self
     menu.addItem(quitItem)
     return menu
@@ -176,14 +176,14 @@ private final class MacosStatusBarController: NSObject {
       result(nil)
     case "setState":
       if let args = call.arguments as? [String: Any] {
-        lastTitle = (args["title"] as? String) ?? "飞牛音乐"
+        lastTitle = (args["title"] as? String) ?? "欣悦音乐"
         lastArtist = (args["artist"] as? String) ?? ""
         displayText = (args["displayText"] as? String) ?? lastTitle
         isPlaying = (args["isPlaying"] as? Bool) ?? false
         isIdle = (args["isIdle"] as? Bool) ?? false
         updateStatusItemTitle()
         if isIdle || lastTitle.isEmpty {
-          statusItem.button?.toolTip = "飞牛音乐"
+          statusItem.button?.toolTip = "欣悦音乐"
         } else {
           let playbackState = isPlaying ? "正在播放" : "已暂停"
           let songDescription = lastArtist.isEmpty ? lastTitle : "\(lastTitle) — \(lastArtist)"
@@ -219,7 +219,7 @@ private final class MacosStatusBarController: NSObject {
   private func updateStatusItemTitle() {
     stopMarquee()
 
-    let title = isIdle || displayText.isEmpty ? "飞牛音乐" : displayText
+    let title = isIdle || displayText.isEmpty ? "欣悦音乐" : displayText
     guard let button = statusItem.button else { return }
     button.setAccessibilityLabel(title)
 

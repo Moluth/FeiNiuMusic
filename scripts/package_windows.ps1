@@ -1,4 +1,4 @@
-﻿# 飞牛音乐 Windows 打包脚本（绿色版 zip）
+﻿# 欣悦音乐 Windows 打包脚本（绿色版 zip）
 #
 # 用法：
 #   .\scripts\package_windows.ps1            # 打包当前版本（自动读 pubspec 版本号）
@@ -54,8 +54,8 @@ if ($Build) {
   }
 }
 
-if (-not (Test-Path (Join-Path $ReleaseDir "飞牛音乐.exe"))) {
-  Write-Error "未找到 飞牛音乐.exe，请先运行 flutter build windows --release 或用 -Build 参数"
+if (-not (Test-Path (Join-Path $ReleaseDir "欣悦音乐.exe"))) {
+  Write-Error "未找到 欣悦音乐.exe，请先运行 flutter build windows --release 或用 -Build 参数"
   exit 1
 }
 
@@ -72,12 +72,12 @@ Copy-Item -Path (Join-Path $ReleaseDir "*") -Destination $Stage -Recurse -Force
 
 # 2. 使用说明
 $Readme = @"
-飞牛音乐 Windows 版 v$Version（免安装绿色版）
+欣悦音乐 Windows 版 v$Version（免安装绿色版）
 
 使用方法：
   1. 把整个文件夹解压到任意位置（如 D:\FeiNiuMusic）。
-  2. 双击 飞牛音乐.exe 即可运行。
-  3. 可选：右键 飞牛音乐.exe → 发送到 → 桌面快捷方式。
+  2. 双击 欣悦音乐.exe 即可运行。
+  3. 可选：右键 欣悦音乐.exe → 发送到 → 桌面快捷方式。
 
 数据说明：
   - 账号、收藏、听歌统计、歌词/封面缓存等数据存放在 exe 同级的

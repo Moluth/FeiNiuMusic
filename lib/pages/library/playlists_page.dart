@@ -1074,10 +1074,13 @@ class _PlaylistDetailPageState extends State<PlaylistDetailPage>
   }
 
   /// 拉取「已加载页之后」的第 [page] 页歌单歌曲（供填充播放使用）。
-  Future<List<SongEntity>> _fetchPlaylistPage(int page) async {
+  Future<List<SongEntity>> _fetchPlaylistPage(
+    int page, {
+    required int loadedPage,
+  }) async {
     final pageData = await _service.getPlaylistTrackPage(
       widget.playlistId,
-      page: _currentPage + page,
+      page: loadedPage + page,
       size: _pageSize,
     );
     return pageData.list
@@ -1089,9 +1092,10 @@ class _PlaylistDetailPageState extends State<PlaylistDetailPage>
   Future<List<SongEntity>> _fetchFilledSongs() async {
     final full = List<SongEntity>.from(_songs.value);
     final cap = AppPlaybackQueueSettings.maxQueueLength.value.clamp(10, 1000);
+    final loadedPage = _currentPage;
     var page = 1;
     while (full.length < cap) {
-      final songs = await _fetchPlaylistPage(page++);
+      final songs = await _fetchPlaylistPage(page++, loadedPage: loadedPage);
       if (songs.isEmpty) break;
       full.addAll(songs);
     }
@@ -1285,24 +1289,32 @@ class _PlaylistDetailPageState extends State<PlaylistDetailPage>
                         onToggleSelectAll: _toggleSelectAll,
                         onPlay: () async {
                           if (_songs.value.isEmpty) return;
+                          final intent = player.beginPlaybackIntent();
                           // 按队列上限拉满整个歌单再播放（顺序或随机）
                           final full = await _fetchFilledSongs();
-                          final queue = List<SongEntity>.from(full);
-                          if (!_isSequentialPlay.value) {
-                            queue.shuffle();
-                          }
-                          await player.playQueue(
-                            queue,
-                            0,
-                            cacheRetentionOwner:
+                          if (!player.isPlaybackIntentCurrent(intent)) return;
+                          final retentionOwner =
                                 StreamCacheService.playlistRetentionOwner(
                                   widget.playlistId,
                                   accountId: AccountStore
                                       .instance
                                       .currentAccountId
                                       .value,
-                                ),
                           );
+                          if (_isSequentialPlay.value) {
+                            await player.playQueue(
+                              full,
+                              0,
+                              cacheRetentionOwner: retentionOwner,
+                              intentToken: intent,
+                            );
+                          } else {
+                            await player.playShuffle(
+                              full,
+                              cacheRetentionOwner: retentionOwner,
+                              intentToken: intent,
+                            );
+                          }
                         },
                         onConfigurePlay: () {},
                         onTogglePlayMode: _togglePlayMode,
@@ -1549,6 +1561,7 @@ class _PlaylistDetailPageState extends State<PlaylistDetailPage>
               _selectedIds.value = next;
               return;
             }
+            final loadedPage = _currentPage;
             await player.playQueueFilledToLimit(
               _songs.value,
               index,
@@ -1556,7 +1569,8 @@ class _PlaylistDetailPageState extends State<PlaylistDetailPage>
                 widget.playlistId,
                 accountId: AccountStore.instance.currentAccountId.value,
               ),
-              fetchMore: _fetchPlaylistPage,
+              fetchMore: (page) =>
+                  _fetchPlaylistPage(page, loadedPage: loadedPage),
             );
           },
           onLongPress: () {

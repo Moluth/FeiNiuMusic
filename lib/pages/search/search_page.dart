@@ -112,9 +112,9 @@ class _SearchPageState extends State<SearchPage> {
 
   /// 拉取「已加载页之后」的第 [page] 页搜索结果（供填充播放使用）。
   /// 当前 _songs 已是第 1 页，填充从第 2 页起。
-  Future<List<SongEntity>> _fetchSearchPage(int page) async {
+  Future<List<SongEntity>> _fetchSearchPage(int page, String query) async {
     final pageData = await _api.searchTrack(
-      query: _query,
+      query: query,
       page: page + 1,
       size: 50,
     );
@@ -129,7 +129,12 @@ class _SearchPageState extends State<SearchPage> {
   /// 播放搜索结果：首屏 50 首不足队列上限时，自动分页拉取更多搜索结果填充。
   void _playSong(int index) {
     if (_songs.isEmpty) return;
-    _player.playQueueFilledToLimit(_songs, index, fetchMore: _fetchSearchPage);
+    final query = _query.trim();
+    _player.playQueueFilledToLimit(
+      _songs,
+      index,
+      fetchMore: (page) => _fetchSearchPage(page, query),
+    );
   }
 
   @override
@@ -348,7 +353,10 @@ class _SearchPageState extends State<SearchPage> {
               children: _albums.map((album) {
                 final coverUrl =
                     album.coverId != null && album.coverId!.isNotEmpty
-                    ? _api.coverUrl(album.coverId!, size: FeiNiuApiClient.coverRequestSize)
+                    ? _api.coverUrl(
+                        album.coverId!,
+                        size: FeiNiuApiClient.coverRequestSize,
+                      )
                     : null;
                 return ListTile(
                   leading: coverUrl != null
@@ -397,7 +405,10 @@ class _SearchPageState extends State<SearchPage> {
               children: _artists.map((artist) {
                 final coverUrl =
                     artist.coverId != null && artist.coverId!.isNotEmpty
-                    ? _api.coverUrl(artist.coverId!, size: FeiNiuApiClient.coverRequestSize)
+                    ? _api.coverUrl(
+                        artist.coverId!,
+                        size: FeiNiuApiClient.coverRequestSize,
+                      )
                     : null;
                 return ListTile(
                   leading: CircleAvatar(

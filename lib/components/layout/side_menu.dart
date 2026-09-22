@@ -147,7 +147,7 @@ class SideMenu extends StatelessWidget {
   }
 
   // ── 顶部头部 ──────────────────────────────────────────────
-  // 服务器信息：第一行服务器名称（备注名，无备注则「飞牛音乐」），
+  // 服务器信息：第一行服务器名称（备注名，无备注则「欣悦音乐」），
   // 第二行 FNID 或服务器地址（FNID 只显示 id，否则显示主机名）。
   // 点击进入账号切换页。无当前账号时退回纯 logo + 应用名。
 
@@ -226,7 +226,7 @@ class SideMenu extends StatelessWidget {
                             ]
                           : [
                               Text(
-                                '飞牛音乐',
+                                '欣悦音乐',
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
                                 style: TextStyle(

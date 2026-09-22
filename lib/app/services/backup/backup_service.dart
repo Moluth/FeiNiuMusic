@@ -167,7 +167,7 @@ class BackupService {
       throw const FormatException('备份文件格式无效');
     }
     if (data['format'] == null || data['app'] != 'feiniu_music') {
-      throw const FormatException('不是有效的飞牛音乐备份文件');
+      throw const FormatException('不是有效的欣悦音乐备份文件');
     }
 
     final applied = <String>[];

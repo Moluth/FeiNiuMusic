@@ -460,30 +460,6 @@ class _HomePageState extends State<HomePage>
     unawaited(_extendAndPlay(song));
   }
 
-  /// 漫游队列扩展器 — 每次队列快播完时调用 roam-next 获取新歌曲追加
-  Future<List<SongEntity>> _roamQueueExtender() async {
-    try {
-      final roamId = _roamId.value;
-      if (roamId == null || roamId.isEmpty) return [];
-
-      final deviceId = await AuthService.instance.ensureDeviceId();
-      final response = await _api.getRoamNext(deviceId, roamId);
-      if (response.next == null) return [];
-
-      // 更新 roamId 以便下一次扩展：基于 current 的 roamId（与 PlayerService
-      // 一致），用 next.roamId 会跳过歌曲。
-      _roamId.value = response.current?.roamId ?? response.next!.roamId;
-
-      final song = _trackService.trackToSongEntity(
-        response.next!.track.toJson(),
-      );
-      return [song];
-    } catch (e) {
-      debugPrint('[HomePage] roam extend error: $e');
-      return [];
-    }
-  }
-
   Future<void> _extendAndPlay(SongEntity first) async {
     try {
       // 直接用 banner 当前漫游链：_loadRoam 已用 getRoamStart 拿到
@@ -510,8 +486,6 @@ class _HomePageState extends State<HomePage>
           roamChainId: roamId,
         );
         debugPrint('[HomePage] extendAndPlay done, roamId=$roamId');
-        // 后续走 PlayerService 内部漫游扩展逻辑（随机模式下播完/切歌追加下一首）
-        _player.queueExtender = _roamQueueExtender;
       }
     } catch (e) {
       debugPrint('[HomePage] roam play error: $e');
@@ -521,7 +495,6 @@ class _HomePageState extends State<HomePage>
         mode: PlaybackMode.shuffle,
         roamChainId: _roamId.value,
       );
-      _player.queueExtender = _roamQueueExtender;
     }
   }
 
@@ -630,6 +603,7 @@ class _HomePageState extends State<HomePage>
     int playIndex = 0,
     List<SongEntity>? fullCache,
   }) async {
+    final intent = _player.beginPlaybackIntent();
     var queue = fullCache ?? preview;
     if (fullCache == null) {
       try {
@@ -640,13 +614,13 @@ class _HomePageState extends State<HomePage>
         debugPrint('[HomePage] fetch full queue error: $e');
       }
     }
-    if (!mounted) return;
+    if (!mounted || !_player.isPlaybackIntentCurrent(intent)) return;
     if (song != null) {
       final idx = queue.indexWhere((s) => s.id == song.id);
-      _player.playQueue(queue, idx >= 0 ? idx : 0);
+      _player.playQueue(queue, idx >= 0 ? idx : 0, intentToken: intent);
     } else {
       final idx = playIndex.clamp(0, queue.length - 1);
-      _player.playQueue(queue, idx);
+      _player.playQueue(queue, idx, intentToken: intent);
     }
   }
 

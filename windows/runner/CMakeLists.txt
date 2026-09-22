@@ -17,8 +17,8 @@ add_executable(${BINARY_NAME} WIN32
 )
 
 # target 名保持 ASCII 供 VS generator 使用（中文 target 名会导致 CMake 生成失败），
-# 产物 exe 名用 OUTPUT_NAME 设为中文（飞牛音乐.exe）。
-set_target_properties(${BINARY_NAME} PROPERTIES OUTPUT_NAME "飞牛音乐")
+# 产物 exe 名用 OUTPUT_NAME 设为中文（欣悦音乐.exe）。
+set_target_properties(${BINARY_NAME} PROPERTIES OUTPUT_NAME "欣悦音乐")
 
 # Apply the standard set of build settings. This can be removed for applications
 # that need different build settings.

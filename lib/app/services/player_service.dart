@@ -93,6 +93,7 @@ class PlayerService with WidgetsBindingObserver {
   /// 当前引擎 run 在逻辑队列中的起始索引。引擎 currentIndexStream 给的是
   /// 引擎内（run 内）索引，映射回逻辑索引需加该偏移。
   int _activeRunStart = 0;
+  bool _activeRunOrderMatchesQueue = false;
 
   /// 升级到 media_kit 的歌曲（just_audio 解码 FLAC 帧超限 `Buffer too small`
   /// 时当场升级，由 FFmpeg 无损解码）。会话内持续生效。
@@ -247,11 +248,6 @@ class PlayerService with WidgetsBindingObserver {
   Future<bool>? _roamAppendInFlight;
   Future<void> _roamMetadataPrecache = Future<void>.value();
 
-  /// 切换到随机模式但当前队列还不是漫游队列（roamId 为空）时置 true，
-  /// 表示当前歌曲播完/切到队尾后应启动漫游（roam-start 拉新链），
-  /// 而不是继续顺序播放原列表。
-  bool _roamStartPending = false;
-
   /// 队列代次标记：每次 playQueue/startRoamPlayback 递增。
   /// 用于丢弃仍在途的漫游追加请求，防止其覆盖用户新选择的队列。
   int _queueGeneration = 0;
@@ -266,6 +262,11 @@ class PlayerService with WidgetsBindingObserver {
   Future<void> _queueAppendChain = Future<void>.value();
   Future<void>? _queueAppendInFlight;
   bool _handlingEngineCompletion = false;
+  Future<void> _playbackModeApplyChain = Future<void>.value();
+  int _playbackModeRequest = 0;
+  int _playbackIntent = 0;
+  List<SongEntity>? _localShuffleSource;
+  int? _localShuffleGeneration;
 
   /// 本次 `_activateLogicalIndex` 期望加载的逻辑索引。
   /// `currentIndexStream` 监听器用它过滤 setAudioSources 期间的过渡广播
@@ -737,24 +738,17 @@ class PlayerService with WidgetsBindingObserver {
           logicalIdx >= 0 &&
           list.isNotEmpty &&
           _roamAppendQueuedCount <= 0) {
-        if (_roamStartPending) {
-          if (logicalIdx == list.length - 1) {
-            _roamStartPending = false;
-            unawaited(_startRoamFromPending());
+        final id = roamId;
+        if (id != null && id.isNotEmpty) {
+          if (shouldPrefillRoamQueue(
+            queueLength: list.length,
+            currentIndex: logicalIdx,
+            queueCap: _queueCap,
+          )) {
+            unawaited(_extendRoamQueue());
           }
-        } else {
-          final id = roamId;
-          if (id != null && id.isNotEmpty) {
-            if (shouldPrefillRoamQueue(
-              queueLength: list.length,
-              currentIndex: logicalIdx,
-              queueCap: _queueCap,
-            )) {
-              unawaited(_extendRoamQueue());
-            }
-          } else if (logicalIdx == list.length - 1) {
-            unawaited(_autoExtendQueue());
-          }
+        } else if (logicalIdx == list.length - 1) {
+          unawaited(_autoExtendQueue());
         }
       }
     });
@@ -835,14 +829,14 @@ class PlayerService with WidgetsBindingObserver {
     if (idx >= list.length - 1) {
       // 逻辑队尾：漫游补链；loop 回卷到逻辑队首（可能跨引擎）。
       if (playbackMode.value == PlaybackMode.shuffle) {
-        if (_roamStartPending) {
-          _roamStartPending = false;
-          await _startRoamFromPending();
-          return;
+        if (roamActive) {
+          await _extendRoamQueue();
+        } else {
+          await _autoExtendQueue();
         }
-        await _autoExtendQueue();
-        if (queue.value.length > list.length) {
-          await _advanceToLogicalIndex(idx + 1, resumePlayback: true);
+        final nextIndex = currentIndex.value + 1;
+        if (nextIndex < queue.value.length) {
+          await _advanceToLogicalIndex(nextIndex, resumePlayback: true);
         }
         return;
       }
@@ -925,7 +919,12 @@ class PlayerService with WidgetsBindingObserver {
     // 引擎相同但不在同一 run，必须走重新激活而不是 seekToNext）。
     if (cur >= 0 && cur < list.length) {
       final bounds = _runBounds(logicalIndex);
-      final sameRun = cur >= bounds.start && cur <= bounds.end;
+      final sameRun =
+          _activeRunOrderMatchesQueue &&
+          _activeRunStart == bounds.start &&
+          _activeEngine.sequenceLength == bounds.end - bounds.start + 1 &&
+          cur >= bounds.start &&
+          cur <= bounds.end;
       if (sameRun) {
         await _activeEngine.seekToNext();
         if (shouldResume && !_activeEngine.playing) {
@@ -1241,6 +1240,7 @@ class PlayerService with WidgetsBindingObserver {
             preload: preload,
           )
           .timeout(MediaKitEngine.openTimeout + const Duration(seconds: 2));
+      _activeRunOrderMatchesQueue = true;
     } catch (e) {
       _pendingLoadLogicalIndex = null;
       if (kDebugMode) {
@@ -1412,18 +1412,27 @@ class PlayerService with WidgetsBindingObserver {
     }
   }
 
-  Future<void> playQueue(
+  int beginPlaybackIntent() => ++_playbackIntent;
+
+  bool isPlaybackIntentCurrent(int intent) => intent == _playbackIntent;
+
+  Future<int?> playQueue(
     List<SongEntity> songs,
     int startIndex, {
     PlaybackMode? mode,
     String? roamChainId,
     String? cacheRetentionOwner,
+    bool forceRebuild = false,
+    int? intentToken,
+    List<SongEntity>? localShuffleSource,
   }) {
+    final intent = intentToken ?? beginPlaybackIntent();
+    if (!isPlaybackIntentCurrent(intent)) return Future<int?>.value();
     final selectedSong = startIndex >= 0 && startIndex < songs.length
         ? songs[startIndex]
         : null;
-    if (openPlayerForActiveSelection(selectedSong)) {
-      return Future<void>.value();
+    if (!forceRebuild && openPlayerForActiveSelection(selectedSong)) {
+      return Future<int?>.value();
     }
     final selectedSongId = selectedSong?.id;
     _pendingSelectionSongId = selectedSongId;
@@ -1433,6 +1442,7 @@ class PlayerService with WidgetsBindingObserver {
       mode: mode,
       roamChainId: roamChainId,
       cacheRetentionOwner: cacheRetentionOwner,
+      localShuffleSource: localShuffleSource,
     ).whenComplete(() {
       if (_pendingSelectionSongId == selectedSongId) {
         _pendingSelectionSongId = null;
@@ -1446,12 +1456,13 @@ class PlayerService with WidgetsBindingObserver {
     });
   }
 
-  Future<void> _playQueueInternal(
+  Future<int?> _playQueueInternal(
     List<SongEntity> songs,
     int startIndex, {
     PlaybackMode? mode,
     String? roamChainId,
     String? cacheRetentionOwner,
+    List<SongEntity>? localShuffleSource,
   }) async {
     final requestedSongId = startIndex >= 0 && startIndex < songs.length
         ? songs[startIndex].id
@@ -1473,7 +1484,7 @@ class PlayerService with WidgetsBindingObserver {
       try {
         await _activeEngine.stop().timeout(const Duration(seconds: 1));
       } catch (_) {}
-      if (generation != _queueGeneration) return;
+      if (generation != _queueGeneration) return null;
     }
     // 用户显式新建播放队列：清除本会话 media_kit「无法播放」黑名单，让
     // 偶发失败（网络抖动/服务器慢/音频设备瞬时不可用）的歌曲在重新点播时
@@ -1487,9 +1498,10 @@ class PlayerService with WidgetsBindingObserver {
     // 等待初始化（含旧播放会话恢复）完成，避免 setAudioSources 与恢复流程
     // 并发交错导致播放器物理 loop/shuffle 状态被覆盖。
     await _initFuture;
-    if (generation != _queueGeneration) return;
+    if (generation != _queueGeneration) return null;
     _clearRestoreSession();
     queueExtender = null;
+    _clearLocalShuffleSource();
     _isExtendingQueue = false;
     // 注意：显式用 this.roamId 强调这是成员字段赋值。历史上参数 roamId 曾
     // 遮蔽成员字段，导致 this.roamId 无法被正确恢复（roamId 永远清空），
@@ -1508,7 +1520,7 @@ class PlayerService with WidgetsBindingObserver {
         .where((s) => (s.uri ?? '').trim().isNotEmpty)
         .where((s) => !_isDefinitelyNonAudio(s))
         .toList();
-    if (playable.isEmpty) return;
+    if (playable.isEmpty) return null;
     final targetId = startIndex >= 0 && startIndex < songs.length
         ? songs[startIndex].id
         : null;
@@ -1523,6 +1535,11 @@ class PlayerService with WidgetsBindingObserver {
         ..clear()
         ..addAll(capped.$1);
       actualIndex = capped.$2;
+    }
+    if (localShuffleSource != null &&
+        mode == PlaybackMode.shuffle &&
+        (roamChainId == null || roamChainId.isEmpty)) {
+      _bindLocalShuffleSource(localShuffleSource, generation);
     }
     if (roamChainId != null && roamChainId.isNotEmpty) {
       unawaited(
@@ -1559,15 +1576,18 @@ class PlayerService with WidgetsBindingObserver {
       if (song != null) {
         await DlnaCastService.instance.loadSong(song);
       }
-      return;
+      return generation == _queueGeneration ? generation : null;
     }
 
     String? loadFailReason;
     Future<bool> loadCurrentRunOnce() async {
+      if (generation != _queueGeneration) return false;
       try {
         await _activateLogicalIndex(actualIndex, preload: true);
+        if (generation != _queueGeneration) return false;
         return true;
       } catch (e) {
+        if (generation != _queueGeneration) return false;
         loadFailReason = e.toString();
         if (kDebugMode) {
           debugPrint('PlayerService.playQueue activate failed: $e');
@@ -1582,14 +1602,17 @@ class PlayerService with WidgetsBindingObserver {
         try {
           await _activeEngine.stop();
         } catch (_) {}
+        if (generation != _queueGeneration) return false;
 
         final current = playable[actualIndex];
         _invalidateResolvedSource(current);
         await _resolvePlayableUri(current, forceRefresh: true);
+        if (generation != _queueGeneration) return false;
         FeiNiuTranscodeService.instance.invalidate(current.id);
 
         try {
           await _activateLogicalIndex(actualIndex, preload: true);
+          if (generation != _queueGeneration) return false;
           return true;
         } catch (e2) {
           loadFailReason = e2.toString();
@@ -1603,10 +1626,7 @@ class PlayerService with WidgetsBindingObserver {
 
     final ok = await loadCurrentRunOnce();
     if (generation != _queueGeneration) {
-      try {
-        await _activeEngine.stop();
-      } catch (_) {}
-      return;
+      return null;
     }
     if (!ok) {
       try {
@@ -1621,25 +1641,28 @@ class PlayerService with WidgetsBindingObserver {
         '${_briefFailureReason(loadFailReason)}',
         type: ToastType.error,
       );
-      return;
+      return null;
     }
 
     // 目标模式：调用方传入（如漫游 shuffle）则用传入值，否则默认 loop。
     // 在引擎加载之后立即应用模式，避免「playQueue 返回后再调
     // setPlaybackMode」的窗口里播完自动顺序切歌（表现为列表循环而非随机）。
     final targetMode = mode ?? PlaybackMode.loop;
-    if (playbackMode.value != targetMode || mode != null) {
-      await setPlaybackMode(targetMode);
-    } else {
-      await _applyPlaybackMode(targetMode);
-    }
+    await _enqueuePlaybackMode(
+      targetMode,
+      reorganizeQueue: false,
+      expectedQueueGeneration: generation,
+    );
+    if (generation != _queueGeneration) return null;
     if (roamActive) {
       unawaited(_extendRoamQueue());
     }
 
     try {
       await _startPlayback();
+      if (generation != _queueGeneration) return null;
     } catch (e) {
+      if (generation != _queueGeneration) return null;
       try {
         await _activeEngine.stop();
       } catch (_) {}
@@ -1648,7 +1671,9 @@ class PlayerService with WidgetsBindingObserver {
       if (kDebugMode) {
         debugPrint('PlayerService.playQueue play failed: $e');
       }
+      return null;
     }
+    return generation;
   }
 
   @visibleForTesting
@@ -1700,25 +1725,29 @@ class PlayerService with WidgetsBindingObserver {
     String? roamChainId,
     String? cacheRetentionOwner,
     Future<List<SongEntity>> Function(int page)? fetchMore,
+    int? intentToken,
   }) async {
+    final intent = intentToken ?? beginPlaybackIntent();
+    if (!isPlaybackIntentCurrent(intent)) return;
     final idx = startIndex >= 0 && startIndex < initialSongs.length
         ? startIndex
         : 0;
     final selectedSong = initialSongs.isEmpty ? null : initialSongs[idx];
     if (openPlayerForActiveSelection(selectedSong)) return;
     // 立即播放：点歌即切歌，currentSong 同步更新，不等后台填充。
-    await playQueue(
+    final gen = await playQueue(
       initialSongs,
       idx,
       mode: mode,
       roamChainId: roamChainId,
       cacheRetentionOwner: cacheRetentionOwner,
+      intentToken: intent,
     );
+    if (gen == null) return;
     // 后台异步填充队列到上限（不阻塞播放切换）。
     if (fetchMore == null) return;
     final cap = _queueCap;
     if (initialSongs.length >= cap) return;
-    final gen = _queueGeneration;
     unawaited(
       _fillQueueInBackground(
         initialSongs,
@@ -1753,6 +1782,10 @@ class PlayerService with WidgetsBindingObserver {
     }
     if (acc.isEmpty) return;
     if (gen != _queueGeneration) return;
+    if (playbackMode.value == PlaybackMode.shuffle && !roamActive) {
+      _mergeLocalShuffleSource(acc, gen);
+      acc.shuffle(Random());
+    }
     if (cacheRetentionOwner != null && cacheRetentionOwner.isNotEmpty) {
       unawaited(
         StreamCacheService.instance.setLongTermOwnerSongs(
@@ -1999,9 +2032,11 @@ class PlayerService with WidgetsBindingObserver {
   Future<void> stopAndClear() async {
     _debugLog('stopAndClear');
     _queueGeneration++;
+    beginPlaybackIntent();
     _pendingSelectionSongId = null;
     _clearRestoreSession();
     queueExtender = null;
+    _clearLocalShuffleSource();
     _isExtendingQueue = false;
     roamId = null;
     _failSkipStreak = 0; // 停止并清空：重置连续失败保护
@@ -2037,7 +2072,11 @@ class PlayerService with WidgetsBindingObserver {
     int startIndex, {
     required bool play,
     Duration? initialPosition,
+    int? expectedGeneration,
   }) async {
+    if (expectedGeneration != null && expectedGeneration != _queueGeneration) {
+      return;
+    }
     _clearRestoreSession();
     final playable = songs
         .where((s) => (s.uri ?? '').trim().isNotEmpty)
@@ -2053,17 +2092,28 @@ class PlayerService with WidgetsBindingObserver {
 
     _applyLogicalQueue(playable, actualIndex);
 
-    _applyEngineKinds(await _computeEngineKinds(playable));
+    final computed = await _computeEngineKinds(playable);
+    if (expectedGeneration != null && expectedGeneration != _queueGeneration) {
+      return;
+    }
+    _applyEngineKinds(computed);
     try {
       await _activateLogicalIndex(
         actualIndex,
         initialPosition: initialPosition,
       );
     } catch (e) {
+      if (expectedGeneration != null &&
+          expectedGeneration != _queueGeneration) {
+        return;
+      }
       await stopAndClear();
       if (kDebugMode) {
         debugPrint('PlayerService._reloadQueue activate failed: $e');
       }
+      return;
+    }
+    if (expectedGeneration != null && expectedGeneration != _queueGeneration) {
       return;
     }
 
@@ -2071,6 +2121,10 @@ class PlayerService with WidgetsBindingObserver {
       try {
         await _startPlayback();
       } catch (e) {
+        if (expectedGeneration != null &&
+            expectedGeneration != _queueGeneration) {
+          return;
+        }
         await stopAndClear();
         if (kDebugMode) {
           debugPrint('PlayerService._reloadQueue play failed: $e');
@@ -2487,21 +2541,20 @@ class PlayerService with WidgetsBindingObserver {
     final queueAppend = _queueAppendInFlight;
     if (queueAppend != null) await queueAppend;
     final list = queue.value;
-    final idx = currentIndex.value;
+    var idx = currentIndex.value;
     if (list.isEmpty || idx < 0) return;
     // 漫游/随机模式：切到队尾时若未预填，先追加一首再前进。
     if (playbackMode.value == PlaybackMode.shuffle) {
-      // 刚切到随机、待启动漫游：手动切下一曲也应创建漫游新队列。
-      if (_roamStartPending) {
-        _roamStartPending = false;
-        await _startRoamFromPending();
-        return;
-      }
       // 队尾无下一首：先拉取追加。等待追加完成（含在途请求）再前进，
       // 避免 run 无源可切时 next 停在队尾。
       if (idx >= list.length - 1) {
-        await _extendRoamQueue();
+        if (roamActive) {
+          await _extendRoamQueue();
+        } else {
+          await _autoExtendQueue();
+        }
         final afterList = queue.value;
+        idx = currentIndex.value;
         if (idx >= afterList.length - 1) {
           return; // 追加失败（网络异常）且仍无可播下一首：停留队尾
         }
@@ -2824,42 +2877,6 @@ class PlayerService with WidgetsBindingObserver {
     });
   }
 
-  /// 播完兜底：当前曲目播完且队列无可播下一首时，追加一首再继续。
-  /// 待启动漫游：当前播放列表被切换为随机模式后，当前曲目播完/切到队尾时
-  /// 调用。用 roam-start 拉取新漫游链替换当前队列并继续播放，实现
-  /// 「列表循环 → 随机」的平滑过渡（播完当前歌后开始漫游）。
-  Future<void> _startRoamFromPending() async {
-    try {
-      final deviceId = await AuthService.instance.ensureDeviceId();
-      final response = await FeiNiuApiClient.instance.getRoamStart(deviceId);
-
-      final songs = <SongEntity>[
-        FeiNiuTrackService.instance.trackToSongEntity(
-          response.current.track.toJson(),
-        ),
-      ];
-      if (response.next != null) {
-        songs.add(
-          FeiNiuTrackService.instance.trackToSongEntity(
-            response.next!.track.toJson(),
-          ),
-        );
-      }
-      // 用漫游新队列替换当前列表循环队列，保持随机模式与 roamId。
-      // playQueue 会设 shuffle 模式、恢复 roamId，播完自动 roam-next 续接。
-      await playQueue(
-        songs,
-        0,
-        mode: PlaybackMode.shuffle,
-        roamChainId: response.current.roamId,
-      );
-    } catch (e) {
-      if (kDebugMode) {
-        debugPrint('PlayerService startRoamFromPending error: $e');
-      }
-    }
-  }
-
   Future<void> previous() async {
     if (isCasting.value) {
       // 投屏遥控模式：先在逻辑队列后退到上一首，再把新歌推送到投屏设备。
@@ -2900,7 +2917,12 @@ class PlayerService with WidgetsBindingObserver {
     // 同 run 判定用 _runBounds 覆盖范围（转码歌是单例 run，prev 虽同引擎但
     // 不在当前 run 时必须走重新激活，不能 seekToPrevious 跨到别首转码歌）。
     final bounds = _runBounds(idx);
-    final sameRun = prev >= bounds.start && prev <= bounds.end;
+    final sameRun =
+        _activeRunOrderMatchesQueue &&
+        _activeRunStart == bounds.start &&
+        _activeEngine.sequenceLength == bounds.end - bounds.start + 1 &&
+        prev >= bounds.start &&
+        prev <= bounds.end;
     if (sameRun) {
       await _activeEngine.seekToPrevious();
     } else {
@@ -3111,9 +3133,12 @@ class PlayerService with WidgetsBindingObserver {
 
   /// 漫游随机播放：roam-start 获取随机曲目 → playQueue 播放 → 切换随机模式
   Future<void> startRoamPlayback() async {
+    final intent = beginPlaybackIntent();
     try {
       final deviceId = await AuthService.instance.ensureDeviceId();
+      if (!isPlaybackIntentCurrent(intent)) return;
       final response = await FeiNiuApiClient.instance.getRoamStart(deviceId);
+      if (!isPlaybackIntentCurrent(intent)) return;
 
       final songs = <SongEntity>[
         FeiNiuTrackService.instance.trackToSongEntity(
@@ -3133,6 +3158,7 @@ class PlayerService with WidgetsBindingObserver {
         0,
         mode: PlaybackMode.shuffle,
         roamChainId: response.current.roamId,
+        intentToken: intent,
       );
       // playQueue 已按传入 mode 设置随机模式、恢复 roamId；漫游模式靠
       // _extendRoamQueue（roamId 非空时路由到 roam-next）在队尾自动追加下一首。
@@ -3146,24 +3172,25 @@ class PlayerService with WidgetsBindingObserver {
   Future<void> playShuffle(
     List<SongEntity> songs, {
     String? cacheRetentionOwner,
+    int? intentToken,
   }) async {
+    final intent = intentToken ?? beginPlaybackIntent();
+    if (!isPlaybackIntentCurrent(intent)) return;
     final base = songs
         .where((s) => (s.uri ?? '').trim().isNotEmpty)
         .where((s) => !_isDefinitelyNonAudio(s))
         .toList();
     if (base.isEmpty) return;
     final playable = [...base]..shuffle(Random());
-    await playQueue(playable, 0, cacheRetentionOwner: cacheRetentionOwner);
-    // 本地乱序队列直接进入随机模式（run 不自动回卷，播完逻辑层续接）
-    try {
-      await _applyPlaybackMode(PlaybackMode.shuffle);
-      playbackMode.value = PlaybackMode.shuffle;
-      _schedulePersistPlaybackState();
-    } catch (e) {
-      if (kDebugMode) debugPrint('playShuffle applyPlaybackMode error: $e');
-    }
-    // 播完末尾自动把原列表重新乱序续接
-    queueExtender = () async => ([...base]..shuffle(Random()));
+    await playQueue(
+      playable,
+      0,
+      mode: PlaybackMode.shuffle,
+      cacheRetentionOwner: cacheRetentionOwner,
+      forceRebuild: true,
+      intentToken: intent,
+      localShuffleSource: base,
+    );
   }
 
   Future<void> cyclePlaybackMode() async {
@@ -3177,27 +3204,153 @@ class PlayerService with WidgetsBindingObserver {
     await setPlaybackMode(next);
   }
 
-  Future<void> setPlaybackMode(PlaybackMode mode) async {
-    await _initFuture;
-    // 先写状态再同步播放器：playbackMode 是唯一真源，
-    // 播放器异步调用即使挂起/失败也不影响 UI 状态与漫游逻辑。
+  Future<void> setPlaybackMode(PlaybackMode mode) => _enqueuePlaybackMode(
+    mode,
+    reorganizeQueue: true,
+    expectedQueueGeneration: _queueGeneration,
+  );
+
+  Future<void> _enqueuePlaybackMode(
+    PlaybackMode mode, {
+    required bool reorganizeQueue,
+    required int expectedQueueGeneration,
+  }) {
+    final request = ++_playbackModeRequest;
     playbackMode.value = mode;
     _debugLog('setPlaybackMode -> ${mode.name}');
     _schedulePersistPlaybackState();
-    try {
-      if (mode == PlaybackMode.shuffle) {
-        // 进入随机模式：run 不自动回卷，播完由逻辑层 roam 补链。
-        // 若当前队列不是漫游队列（roamId 为空），标记「当前曲播完后启动漫游」，
-        // 让播完/切到队尾时走 roam-start 而非继续顺序播原列表。
-        _roamStartPending = roamId == null || roamId!.isEmpty;
-        await _applyPlaybackMode(mode);
-      } else {
-        _roamStartPending = false;
-        await _applyPlaybackMode(mode);
+
+    final previous = _playbackModeApplyChain;
+    final task = previous.catchError((_) {}).then((_) async {
+      await _initFuture;
+      if (request != _playbackModeRequest ||
+          expectedQueueGeneration != _queueGeneration) {
+        return;
       }
-    } catch (e) {
-      if (kDebugMode) debugPrint('setPlaybackMode(${mode.name}) error: $e');
+      try {
+        if (mode == PlaybackMode.shuffle && !roamActive) {
+          final currentQueue = queue.value;
+          final index = currentIndex.value;
+          if (_localShuffleGeneration != expectedQueueGeneration) {
+            _bindLocalShuffleSource(currentQueue, expectedQueueGeneration);
+          } else {
+            _installLocalShuffleExtender(expectedQueueGeneration);
+          }
+          if (reorganizeQueue && index >= 0 && index < currentQueue.length) {
+            await _shuffleUpcomingWithoutReload(
+              expectedQueueGeneration,
+              request,
+            );
+            if (request != _playbackModeRequest ||
+                expectedQueueGeneration != _queueGeneration) {
+              return;
+            }
+          }
+        } else {
+          queueExtender = null;
+          if (roamActive) _clearLocalShuffleSource();
+        }
+        await _applyPlaybackMode(mode);
+      } catch (e) {
+        if (kDebugMode) debugPrint('setPlaybackMode(${mode.name}) error: $e');
+      }
+    });
+    _playbackModeApplyChain = task.catchError((_) {});
+    return task;
+  }
+
+  Future<void> _shuffleUpcomingWithoutReload(
+    int expectedGeneration,
+    int modeRequest,
+  ) async {
+    final oldQueue = queue.value;
+    final index = currentIndex.value;
+    if (index < 0 ||
+        index >= oldQueue.length - 1 ||
+        _engineKinds.length != oldQueue.length ||
+        _engineTranscodeFlags.length != oldQueue.length) {
+      return;
     }
+
+    final entries = <({SongEntity song, EngineKind kind, bool transcode})>[
+      for (var i = 0; i < oldQueue.length; i++)
+        (
+          song: oldQueue[i],
+          kind: _engineKinds[i],
+          transcode: _engineTranscodeFlags[i],
+        ),
+    ];
+    final shuffledTail = entries.sublist(index + 1)..shuffle(Random());
+    final shuffled = <({SongEntity song, EngineKind kind, bool transcode})>[
+      ...entries.take(index + 1),
+      ...shuffledTail,
+    ];
+
+    if (isCasting.value) {
+      _activeRunOrderMatchesQueue = false;
+      queue.value = shuffled.map((entry) => entry.song).toList();
+      _engineKinds = shuffled.map((entry) => entry.kind).toList();
+      _engineTranscodeFlags = shuffled.map((entry) => entry.transcode).toList();
+      _schedulePersistPlaybackState();
+      _emitSnapshot(force: true);
+      return;
+    }
+
+    final oldBounds = _runBounds(index);
+    final localIndex = index - oldBounds.start;
+    final expectedEngine = _activeEngine;
+    final canTrimInPlace =
+        _activeRunOrderMatchesQueue &&
+        _activeRunStart == oldBounds.start &&
+        expectedEngine.sequenceLength == oldBounds.end - oldBounds.start + 1 &&
+        expectedEngine.currentIndex == localIndex;
+    if (!canTrimInPlace) return;
+
+    final previous = _loadQueueLock;
+    final completer = Completer<void>();
+    _loadQueueLock = completer.future;
+    try {
+      await previous;
+      if (expectedGeneration != _queueGeneration ||
+          modeRequest != _playbackModeRequest ||
+          !identical(queue.value, oldQueue) ||
+          !identical(_activeEngine, expectedEngine)) {
+        return;
+      }
+      _activeRunOrderMatchesQueue = false;
+      for (var i = expectedEngine.sequenceLength - 1; i > localIndex; i--) {
+        await expectedEngine.removeItem(i);
+        if (expectedGeneration != _queueGeneration ||
+            !identical(_activeEngine, expectedEngine)) {
+          return;
+        }
+      }
+      if (modeRequest != _playbackModeRequest ||
+          !identical(queue.value, oldQueue)) {
+        return;
+      }
+      queue.value = shuffled.map((entry) => entry.song).toList();
+      _engineKinds = shuffled.map((entry) => entry.kind).toList();
+      _engineTranscodeFlags = shuffled.map((entry) => entry.transcode).toList();
+      _schedulePersistPlaybackState();
+      _emitSnapshot(force: true);
+    } finally {
+      if (!completer.isCompleted) completer.complete();
+    }
+  }
+
+  @visibleForTesting
+  static List<SongEntity> shuffleQueueAfterCurrent(
+    List<SongEntity> songs,
+    int currentIndex, {
+    Random? random,
+  }) {
+    if (currentIndex < 0 || currentIndex >= songs.length - 1) {
+      return List<SongEntity>.from(songs);
+    }
+    final shuffledTail = songs.sublist(currentIndex + 1)
+      ..shuffle(random ?? Random());
+    return <SongEntity>[...songs.take(currentIndex + 1), ...shuffledTail];
   }
 
   /// 临时让当前歌曲播放结束后暂停，不自动切换或单曲循环。
@@ -3697,6 +3850,12 @@ class PlayerService with WidgetsBindingObserver {
     roamId = session.roamId;
     _applyLogicalQueue(session.queue, session.index);
     playbackMode.value = session.mode;
+    if (session.mode == PlaybackMode.shuffle &&
+        (session.roamId == null || session.roamId!.isEmpty)) {
+      _bindLocalShuffleSource(session.queue, _queueGeneration);
+    } else {
+      _clearLocalShuffleSource();
+    }
     _debugLog('restoreUiState -> mode=${session.mode.name}');
     position.value = session.position;
     bufferedPosition.value = Duration.zero;
@@ -4213,6 +4372,41 @@ class PlayerService with WidgetsBindingObserver {
     _sourceResolveInflight.remove(song.id);
   }
 
+  void _bindLocalShuffleSource(List<SongEntity> songs, int generation) {
+    _localShuffleSource = List<SongEntity>.unmodifiable(songs);
+    _localShuffleGeneration = generation;
+    _installLocalShuffleExtender(generation);
+  }
+
+  void _installLocalShuffleExtender(int generation) {
+    queueExtender = () async {
+      if (generation != _queueGeneration ||
+          generation != _localShuffleGeneration) {
+        return const <SongEntity>[];
+      }
+      final source = _localShuffleSource;
+      if (source == null) return const <SongEntity>[];
+      return List<SongEntity>.from(source)..shuffle(Random());
+    };
+  }
+
+  void _mergeLocalShuffleSource(List<SongEntity> songs, int generation) {
+    if (generation != _localShuffleGeneration) return;
+    final source = _localShuffleSource;
+    if (source == null) return;
+    final ids = source.map((song) => song.id).toSet();
+    final merged = <SongEntity>[...source];
+    for (final song in songs) {
+      if (ids.add(song.id)) merged.add(song);
+    }
+    _bindLocalShuffleSource(merged, generation);
+  }
+
+  void _clearLocalShuffleSource() {
+    _localShuffleSource = null;
+    _localShuffleGeneration = null;
+  }
+
   Future<void> _autoExtendQueue() async {
     // 漫游模式走 _extendRoamQueue（roam-next）；本地随机（playShuffle）与
     // 顺序模式共用 queueExtender。防止与 _extendRoamQueue 并发重复追加。
@@ -4363,6 +4557,10 @@ class PlayerService with WidgetsBindingObserver {
     }
     try {
       await _activateLogicalIndex(newCurrentIdx, initialPosition: pos);
+      if (appendGeneration != _queueGeneration ||
+          !identical(queue.value, allSongs)) {
+        return;
+      }
       if (wasPlaying && !_activeEngine.playing) {
         await _activeEngine.play();
       }
@@ -4398,6 +4596,7 @@ class PlayerService with WidgetsBindingObserver {
   }
 
   void _applyLogicalQueue(List<SongEntity> songs, int currentQueueIndex) {
+    _activeRunOrderMatchesQueue = false;
     queue.value = songs;
     if (songs.isEmpty) {
       currentIndex.value = -1;

@@ -42,7 +42,7 @@ class _VolumeSettingsPageState extends State<VolumeSettingsPage> {
                   final percent = (volume * 100).round();
                   return AppSettingSlider(
                     title: '应用音量',
-                    description: '只调整 飞牛音乐 的播放音量，不改变系统音量',
+                    description: '只调整 欣悦音乐 的播放音量，不改变系统音量',
                     value: volume,
                     min: 0,
                     max: 1,

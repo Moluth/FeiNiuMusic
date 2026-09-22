@@ -461,14 +461,22 @@ class _FoldersPageState extends State<FoldersPage>
 
   /// 拉取「已加载页之后」的第 [page] 页文件歌曲（供 playQueueFilledToLimit
   /// 的 fetchMore 使用）。返回一页展平后的 SongEntity。
-  Future<List<SongEntity>> _fetchFolderPage(int page) async {
-    final nextPage = _files.value.length ~/ _pageSize + page;
+  Future<List<SongEntity>> _fetchFolderPage(
+    int page, {
+    required String path,
+    required String keyword,
+    required bool flatten,
+    required String sort,
+    required bool ascending,
+    required int loadedFileCount,
+  }) async {
+    final nextPage = loadedFileCount ~/ _pageSize + page;
     final listing = await _service.list(
-      path: _path.value,
-      keyword: _searchQuery.value,
-      flatten: _flatten.value,
-      sort: _sortKey.value,
-      asc: _ascending.value,
+      path: path,
+      keyword: keyword,
+      flatten: flatten,
+      sort: sort,
+      asc: ascending,
       page: nextPage,
       pageSize: _pageSize,
     );
@@ -486,10 +494,26 @@ class _FoldersPageState extends State<FoldersPage>
     final songs = _allSongs;
     if (songs.isEmpty) return;
     final start = songs.indexWhere((s) => s.id == track.guid);
+    final path = _path.value;
+    final keyword = _searchQuery.value;
+    final flatten = _flatten.value;
+    final sort = _sortKey.value;
+    final ascending = _ascending.value;
+    final loadedFileCount = _files.value.length;
     _player.playQueueFilledToLimit(
       songs,
       start < 0 ? 0 : start,
-      fetchMore: _searchQuery.value.isNotEmpty ? null : _fetchFolderPage,
+      fetchMore: keyword.isNotEmpty
+          ? null
+          : (page) => _fetchFolderPage(
+              page,
+              path: path,
+              keyword: keyword,
+              flatten: flatten,
+              sort: sort,
+              ascending: ascending,
+              loadedFileCount: loadedFileCount,
+            ),
     );
   }
 
@@ -799,13 +823,12 @@ class _FoldersPageState extends State<FoldersPage>
   }
 
   /// 随机播放：加载完整目录后打乱全部歌曲加入队列。
-  void _shufflePlay() {
-    _ensureAllLoaded().then((_) {
-      if (!mounted) return;
-      final songs = [..._allSongs]..shuffle();
-      if (songs.isEmpty) return;
-      _player.playQueueFilledToLimit(songs, 0);
-    });
+  Future<void> _shufflePlay() async {
+    final intent = _player.beginPlaybackIntent();
+    await _ensureAllLoaded();
+    if (!mounted || !_player.isPlaybackIntentCurrent(intent)) return;
+    if (_allSongs.isEmpty) return;
+    await _player.playShuffle(_allSongs, intentToken: intent);
   }
 
   Widget _buildFolderRow(FolderDir dir) {

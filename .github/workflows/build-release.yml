@@ -161,7 +161,7 @@ jobs:
             FnMusicEnhance-*.fpk
             pubspec.yaml
 
-  # macOS：随 release 发布（绿色版 zip，内含 飞牛音乐.app）。
+  # macOS：随 release 发布（绿色版 zip，内含 欣悦音乐.app）。
   # 未做签名公证，用户首次打开需 右键 → 打开 绕过 Gatekeeper。
   build-macos:
     runs-on: macos-latest
@@ -190,12 +190,12 @@ jobs:
           flutter build macos --release
           cd build/macos/Build/Products/Release
           # 1) 绿色版 zip（便携，免安装；ditto 保留 .app 内符号链接）
-          ditto -c -k --sequesterRsrc --keepParent "飞牛音乐.app" \
+          ditto -c -k --sequesterRsrc --keepParent "欣悦音乐.app" \
             "${GITHUB_WORKSPACE}/FeiNiuMusic-v${VERSION}-MacOS.zip"
           # 2) 安装版 dmg（标准分发格式：挂载后拖入"应用程序"）
           STAGE="${GITHUB_WORKSPACE}/dmg-stage"
           rm -rf "$STAGE" && mkdir -p "$STAGE"
-          cp -R "飞牛音乐.app" "$STAGE/"
+          cp -R "欣悦音乐.app" "$STAGE/"
           ln -s /Applications "$STAGE/Applications"
           hdiutil create -volname "FeiNiuMusic" -srcfolder "$STAGE" \
             -ov -format UDZO \
@@ -275,7 +275,7 @@ jobs:
 
           ---
           **安装说明**
-          - **macOS**：打开 dmg 把 飞牛音乐.app 拖入"应用程序"，或解压 zip 后直接运行。
+          - **macOS**：打开 dmg 把 欣悦音乐.app 拖入"应用程序"，或解压 zip 后直接运行。
             未签名应用首次打开需 右键 → 打开 确认。
           - **iOS（未签名 ipa）**：需自行签名安装，可用 Sideloadly / AltStore / Xcode
             免费账号（免费签名 7 天过期需重新安装）。

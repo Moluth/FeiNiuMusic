@@ -1,4 +1,4 @@
-# FeiNiuMusic
+# 欣悦音乐
 
 飞牛私有云（FNOS）平台的第三方音乐客户端。通过飞牛 NAS 自带的音乐服务 API获取音乐库、播放流和歌词数据，提供完整的在线音乐播放体验。
 
@@ -60,7 +60,7 @@
 - **收藏与管理** — 收藏歌曲、创建/编辑歌单
 - **文件夹视图** — 按 NAS 文件系统目录层级浏览音乐（配合服务端增强应用）：目录树 + 面包屑导航、排序（文件名/创建时间/时长/大小）、随机播放、分页加载更多、CUE 整轨按曲目拆分展示、递归搜索当前目录树、平铺视图（一键展示当前目录及子文件夹全部歌曲）、长按歌曲详情与多选管理
 - **数据匹配（服务端增强数据源）** — 配合运行在 NAS 上的 [FnMusicEnhance](https://github.com/kuilei0926/FnMusicEnhance)（端口 38200）提供多平台歌曲信息/歌词/封面搜索（网易云 / QQ / 酷狗 / 汽水 / Apple）：在歌曲信息编辑页**一键匹配**歌曲信息，或歌曲页多选后**批量匹配**（服务端全自动写入歌手/歌词/专辑/封面）；支持**批量刷新**（全部歌曲信息 / 歌手图片 / 专辑图片，替换封面时删除旧图）；歌词支持**逐字（卡拉OK）**渲染（QQ/酷狗/汽水逐字源）；设置页可维护搜索平台（启用 / 排序，由客户端决定，服务端按客户端排序分组）与匹配偏好（歌词模式 / 简繁转换 / 过滤规则 / 并发）
-- **服务端增强（FnMusicEnhance）** — 配合运行在 NAS 上的[增强应用](https://github.com/kuilei0926/FnMusicEnhance)（端口 38200）：歌词修改（歌曲信息编辑页直接读写歌词）、歌手/专辑编辑（改名 + 封面写入）、文件夹视图、数据源搜索 / 批量匹配 / 批量刷新；设置页可检测连接状态（区分「未安装」与「已安装但不可达」），认证使用飞牛音乐登录 token，无需单独配置密钥
+- **服务端增强（FnMusicEnhance）** — 配合运行在 NAS 上的[增强应用](https://github.com/kuilei0926/FnMusicEnhance)（端口 38200）：歌词修改（歌曲信息编辑页直接读写歌词）、歌手/专辑编辑（改名 + 封面写入）、文件夹视图、数据源搜索 / 批量匹配 / 批量刷新；设置页可检测连接状态（区分「未安装」与「已安装但不可达」），认证使用欣悦音乐登录 token，无需单独配置密钥
 
 ### 界面与适配
 
@@ -86,7 +86,7 @@
 
 ## Android Auto 支持
 
-飞牛音乐通过 `audio_service` 注册系统 MediaSession / MediaBrowserService，
+欣悦音乐通过 `audio_service` 注册系统 MediaSession / MediaBrowserService，
 支持在 Android Auto（手机投屏）与 Android Automotive OS（车机版）上显示和控制播放：
 
 - **启动器可见**：应用启动即注册媒体会话，Android Auto 启动器可直接发现本应用
@@ -98,7 +98,7 @@
 
 1. 手机安装本应用，并安装 Android Auto 应用
 2. 通过数据线连接支持 Android Auto 的车机（或使用 Android Auto 模拟器）
-3. 在车机启动器中选择「飞牛音乐」
+3. 在车机启动器中选择「欣悦音乐」
 
 ## 界面预览
 
@@ -212,9 +212,9 @@ flutter build windows --release
 
 | 安装包 | 包名（applicationId） | 适用 |
 | --- | --- | --- |
-| `FeiNiuMusic-vX.Y.Z-arm64-v8a.apk` | `com.feiniu.music`（正式） | 常规设备，飞牛音乐正式包（arm64） |
-| `FeiNiuMusic-vX.Y.Z-armeabi-v7a.apk` | `com.feiniu.music`（正式） | 常规设备，飞牛音乐正式包（32 位） |
-| `FeiNiuMusic-vX.Y.Z-x86_64.apk` | `com.feiniu.music`（正式） | 常规设备，飞牛音乐正式包（x86_64） |
+| `FeiNiuMusic-vX.Y.Z-arm64-v8a.apk` | `com.feiniu.music`（正式） | 常规设备，欣悦音乐正式包（arm64） |
+| `FeiNiuMusic-vX.Y.Z-armeabi-v7a.apk` | `com.feiniu.music`（正式） | 常规设备，欣悦音乐正式包（32 位） |
+| `FeiNiuMusic-vX.Y.Z-x86_64.apk` | `com.feiniu.music`（正式） | 常规设备，欣悦音乐正式包（x86_64） |
 | `FeiNiuMusic-vX.Y.Z-z-luna-arm64-v8a.apk` | `com.luna.music`（音乐控制兼容，非官方） | 鸿蒙 4/6、iQOO、VIVO 汽水音频控制问题（仅 arm64） |
 
 四个安装包可以同时安装、互不影响数据；不确定时请安装正式包。

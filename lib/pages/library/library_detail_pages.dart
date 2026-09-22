@@ -411,11 +411,16 @@ class _ArtistDetailPageState extends State<ArtistDetailPage>
                         onPressed: songs.isEmpty
                             ? null
                             : () async {
+                                final intent = player.beginPlaybackIntent();
                                 // 按队列上限拉满再随机
                                 final full = await _fetchFilledSongs();
-                                final shuffled = List<SongEntity>.from(full)
-                                  ..shuffle();
-                                await player.playQueue(shuffled, 0);
+                                if (!player.isPlaybackIntentCurrent(intent)) {
+                                  return;
+                                }
+                                await player.playShuffle(
+                                  full,
+                                  intentToken: intent,
+                                );
                               },
                       ),
                       IconButton(
@@ -425,8 +430,16 @@ class _ArtistDetailPageState extends State<ArtistDetailPage>
                         onPressed: songs.isEmpty
                             ? null
                             : () async {
+                                final intent = player.beginPlaybackIntent();
                                 final full = await _fetchFilledSongs();
-                                await player.playQueue(full, 0);
+                                if (!player.isPlaybackIntentCurrent(intent)) {
+                                  return;
+                                }
+                                await player.playQueue(
+                                  full,
+                                  0,
+                                  intentToken: intent,
+                                );
                               },
                       ),
                     ],
@@ -981,11 +994,16 @@ class _AlbumDetailPageState extends State<AlbumDetailPage>
                         onPressed: songs.isEmpty
                             ? null
                             : () async {
+                                final intent = player.beginPlaybackIntent();
                                 // 按队列上限拉满再随机
                                 final full = await _fetchFilledSongs();
-                                final shuffled = List<SongEntity>.from(full)
-                                  ..shuffle();
-                                await player.playQueue(shuffled, 0);
+                                if (!player.isPlaybackIntentCurrent(intent)) {
+                                  return;
+                                }
+                                await player.playShuffle(
+                                  full,
+                                  intentToken: intent,
+                                );
                               },
                       ),
                       IconButton(
@@ -995,8 +1013,16 @@ class _AlbumDetailPageState extends State<AlbumDetailPage>
                         onPressed: songs.isEmpty
                             ? null
                             : () async {
+                                final intent = player.beginPlaybackIntent();
                                 final full = await _fetchFilledSongs();
-                                await player.playQueue(full, 0);
+                                if (!player.isPlaybackIntentCurrent(intent)) {
+                                  return;
+                                }
+                                await player.playQueue(
+                                  full,
+                                  0,
+                                  intentToken: intent,
+                                );
                               },
                       ),
                     ],

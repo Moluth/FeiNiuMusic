@@ -195,7 +195,7 @@ const String _webHtml = '''
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>飞牛音乐 · TV 扫码登录</title>
+<title>欣悦音乐 · TV 扫码登录</title>
 <style>
   body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
          background: #f4f5f7; margin: 0; padding: 24px 16px; color: #1f2937; }
@@ -215,7 +215,7 @@ const String _webHtml = '''
 </head>
 <body>
   <div class="card">
-    <h1>飞牛音乐 · TV 扫码登录</h1>
+    <h1>欣悦音乐 · TV 扫码登录</h1>
     <p class="sub">请在电视上确认配对信息后填写以下内容</p>
     <label>服务器地址或 FNID</label>
     <input id="serverInput" placeholder="https://ip:port 或 FNID" autocomplete="off">

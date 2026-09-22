@@ -887,12 +887,16 @@ class _GenreDetailPageState extends State<GenreDetailPage>
   }
 
   /// 拉取「已加载页之后」的第 [page] 页流派歌曲（供填充播放使用）。
-  Future<List<SongEntity>> _fetchGenrePage(int page) async {
+  Future<List<SongEntity>> _fetchGenrePage(
+    int page, {
+    required int loadedPage,
+    required String sort,
+  }) async {
     final pageData = await _api.getGenreTracks(
       genreGUID: widget.genre.guid,
-      page: _currentPage + page,
+      page: loadedPage + page,
       size: _pageSize,
-      sort: _apiSortParam(),
+      sort: sort,
     );
     return pageData.list
         .map((t) => _trackService.trackToSongEntity(t))
@@ -903,7 +907,14 @@ class _GenreDetailPageState extends State<GenreDetailPage>
   void _playSong(int index) {
     final songs = _songs.value;
     if (songs.isEmpty) return;
-    _player.playQueueFilledToLimit(songs, index, fetchMore: _fetchGenrePage);
+    final loadedPage = _currentPage;
+    final sort = _apiSortParam();
+    _player.playQueueFilledToLimit(
+      songs,
+      index,
+      fetchMore: (page) =>
+          _fetchGenrePage(page, loadedPage: loadedPage, sort: sort),
+    );
   }
 
   void _showSortSheet() {

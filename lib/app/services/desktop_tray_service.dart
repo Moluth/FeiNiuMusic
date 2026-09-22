@@ -78,7 +78,7 @@ class DesktopTrayService with WindowListener, TrayListener {
   Future<void> _ensureTray() async {
     if (_trayReady) return;
     await TrayManager.instance.setIcon(_iconAsset);
-    await TrayManager.instance.setToolTip('飞牛音乐');
+    await TrayManager.instance.setToolTip('欣悦音乐');
     // 先置位再刷新：_refreshMenu 内部有 _trayReady 守卫，否则首次菜单发不出。
     _trayReady = true;
     await _refreshMenu();
@@ -98,7 +98,7 @@ class DesktopTrayService with WindowListener, TrayListener {
     final title = song?.title.trim() ?? '';
     final artist = song?.artistDisplayName.trim() ?? '';
     final info = song == null
-        ? '飞牛音乐'
+        ? '欣悦音乐'
         : '${isPlaying ? '正在播放' : '已暂停'}：$title'
             '${artist.isEmpty ? '' : ' — $artist'}';
 

@@ -90,12 +90,12 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName", "com.feiniu.music" "\0"
-            VALUE "FileDescription", "飞牛音乐" "\0"
+            VALUE "FileDescription", "欣悦音乐" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
-            VALUE "InternalName", "飞牛音乐" "\0"
+            VALUE "InternalName", "欣悦音乐" "\0"
             VALUE "LegalCopyright", "Copyright (C) 2026 com.lanke. All rights reserved." "\0"
-            VALUE "OriginalFilename", "飞牛音乐.exe" "\0"
-            VALUE "ProductName", "飞牛音乐" "\0"
+            VALUE "OriginalFilename", "欣悦音乐.exe" "\0"
+            VALUE "ProductName", "欣悦音乐" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END
