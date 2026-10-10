@@ -196,7 +196,7 @@ class _ConnectionFailedActionState extends State<_ConnectionFailedAction>
             final String tooltip;
             if (probing) {
               // 正在连接/重连探测：WiFi 信号格数递进循环动画
-              tooltip = '正在重连中...';
+              tooltip = '正在同步内容...';
               icon = AnimatedBuilder(
                 animation: _wifiController,
                 builder: (context, _) {
@@ -212,7 +212,7 @@ class _ConnectionFailedActionState extends State<_ConnectionFailedAction>
               );
             } else {
               // 连接失败：红色断开
-              tooltip = '服务器连接失败，点击处理';
+              tooltip = '暂时无法同步，点击查看';
               icon = Icon(
                 Icons.wifi_off_rounded,
                 size: 18,

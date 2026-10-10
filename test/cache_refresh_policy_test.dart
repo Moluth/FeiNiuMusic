@@ -6,6 +6,7 @@ import 'package:feiniu_music/app/services/lyrics/lyrics_repository.dart';
 import 'package:feiniu_music/app/services/player_service.dart';
 import 'package:feiniu_music/app/state/song_state.dart';
 import 'package:feiniu_music/pages/home/favorite_page.dart';
+import 'package:feiniu_music/pages/home/home_page.dart';
 
 void main() {
   group('favorite count label', () {
@@ -131,6 +132,36 @@ void main() {
         ),
         isFalse,
       );
+    });
+  });
+
+  group('home roam cache', () {
+    const cached = [
+      SongEntity(id: 'a', title: 'A', artist: '[]'),
+      SongEntity(id: 'b', title: 'B', artist: '[]'),
+    ];
+
+    test('keeps cached songs first and appends fresh songs', () {
+      const fresh = [
+        SongEntity(id: 'c', title: 'C', artist: '[]'),
+        SongEntity(id: 'd', title: 'D', artist: '[]'),
+      ];
+
+      final merged = mergeRoamQueue(cached, fresh, limit: 10);
+
+      expect(merged.map((song) => song.id), ['a', 'b', 'c', 'd']);
+    });
+
+    test('deduplicates fresh songs and respects the queue limit', () {
+      const fresh = [
+        SongEntity(id: 'b', title: 'B', artist: '[]'),
+        SongEntity(id: 'c', title: 'C', artist: '[]'),
+        SongEntity(id: 'd', title: 'D', artist: '[]'),
+      ];
+
+      final merged = mergeRoamQueue(cached, fresh, limit: 3);
+
+      expect(merged.map((song) => song.id), ['a', 'b', 'c']);
     });
   });
 

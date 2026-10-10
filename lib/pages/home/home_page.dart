@@ -32,6 +32,8 @@ import 'widgets/home_shortcut_menu.dart';
 
 /// 首页缓存
 class _HomeCacheData {
+  final List<SongEntity>? roamQueue;
+  final String? roamId;
   final List<SongEntity>? favorites;
   final List<SongEntity>? recentSongs;
   final List<FeiNiuAlbum>? recentAlbums;
@@ -39,6 +41,8 @@ class _HomeCacheData {
   final List<SongEntity>? recentTracks;
 
   _HomeCacheData({
+    this.roamQueue,
+    this.roamId,
     this.favorites,
     this.recentSongs,
     this.recentAlbums,
@@ -47,6 +51,7 @@ class _HomeCacheData {
   });
 
   bool get isEmpty =>
+      (roamQueue == null || roamQueue!.isEmpty) &&
       (favorites == null || favorites!.isEmpty) &&
       (recentSongs == null || recentSongs!.isEmpty) &&
       (recentAlbums == null || recentAlbums!.isEmpty) &&
@@ -54,6 +59,8 @@ class _HomeCacheData {
       (recentTracks == null || recentTracks!.isEmpty);
 
   Map<String, dynamic> toJson() => {
+    'roamQueue': roamQueue?.map((s) => s.toMap()).toList(),
+    'roamId': roamId,
     'favorites': favorites?.map((s) => s.toMap()).toList(),
     'recentSongs': recentSongs?.map((s) => s.toMap()).toList(),
     'recentAlbums': recentAlbums?.map((a) => a.toJson()).toList(),
@@ -62,6 +69,10 @@ class _HomeCacheData {
   };
 
   static _HomeCacheData fromJson(Map<String, dynamic> json) => _HomeCacheData(
+    roamQueue: (json['roamQueue'] as List?)
+        ?.map((e) => SongEntity.fromMap(e as Map<String, dynamic>))
+        .toList(),
+    roamId: json['roamId'] as String?,
     favorites: (json['favorites'] as List?)
         ?.map((e) => SongEntity.fromMap(e as Map<String, dynamic>))
         .toList(),
@@ -78,6 +89,22 @@ class _HomeCacheData {
         ?.map((e) => SongEntity.fromMap(e as Map<String, dynamic>))
         .toList(),
   );
+}
+
+@visibleForTesting
+List<SongEntity> mergeRoamQueue(
+  List<SongEntity> cached,
+  List<SongEntity> fresh, {
+  required int limit,
+}) {
+  final merged = <SongEntity>[];
+  final ids = <String>{};
+  for (final song in [...cached, ...fresh]) {
+    if (song.id.isEmpty || !ids.add(song.id)) continue;
+    merged.add(song);
+    if (merged.length >= limit) break;
+  }
+  return merged;
 }
 
 /// 首页播放数据源：决定点播放时按队列上限请求哪个 API 填充完整队列。
@@ -109,12 +136,26 @@ class _HomePageState extends State<HomePage>
   late final _playlists = createSignal<List<FeiNiuPlaylist>>([]);
   late final _recentTracks = createSignal<List<SongEntity>>([]);
   late final _isRefreshing = createSignal(false);
+  Timer? _homeCachePersistTimer;
+  Future<void> _homeCacheWriteChain = Future<void>.value();
+  bool _homeCacheReady = false;
+  bool _roamNetworkLoaded = false;
+  bool _refreshingRoam = false;
 
   @override
   void initState() {
     super.initState();
+    _player.snapshot.addListener(_syncPendingRoamFromPlayer);
     _loadAll();
     _maybeShowTvEdgeHint();
+  }
+
+  @override
+  void dispose() {
+    _player.snapshot.removeListener(_syncPendingRoamFromPlayer);
+    _homeCachePersistTimer?.cancel();
+    if (_homeCacheReady) unawaited(_persistHomeCache());
+    super.dispose();
   }
 
   /// TV 首次启动：展示「按右键打开播放页」提示（只一次，会话级别持久化）。
@@ -142,7 +183,7 @@ class _HomePageState extends State<HomePage>
 
     // 缓存永久保留（读取 ignoreTtl，TTL 不淘汰），但只用于快速渲染：
     // 命中后立即展示，同时继续在后台异步刷新数据，完成后覆盖缓存。
-    if (!forceRefresh) {
+    if (!_homeCacheReady) {
       final cachedJson = await ApiCacheManager.instance.getPersisted(
         homeCacheScope,
         homeCacheKey,
@@ -153,6 +194,9 @@ class _HomePageState extends State<HomePage>
             jsonDecode(cachedJson) as Map<String, dynamic>,
           );
           if (!mounted) return;
+          if (cached.roamQueue != null && cached.roamQueue!.isNotEmpty) {
+            _setRoamQueue(cached.roamQueue!, roamId: cached.roamId);
+          }
           if (cached.favorites != null) {
             _favoriteSongs.value = cached.favorites!;
           }
@@ -176,11 +220,13 @@ class _HomePageState extends State<HomePage>
         }
       }
     }
+    _homeCacheReady = true;
+    _syncPendingRoamFromPlayer();
 
     // 后台异步刷新最新数据（缓存渲染后继续执行），完成后写回缓存
     _isRefreshing.value = !_loading.value; // 非首次加载才显示右上角转圈
     await Future.wait([
-      _loadRoam(),
+      _loadRoam(force: forceRefresh),
       _loadFavorites(),
       _loadRecentHistory(),
       _loadRecentAlbums(),
@@ -193,6 +239,7 @@ class _HomePageState extends State<HomePage>
       _preloadHomeCovers();
       debugPrint(
         '[HomePage] loadAll done: '
+        'roam=${_roamQueue.value.length} '
         'favorites=${_favoriteSongs.value.length} '
         'history=${_recentSongs.value.length} '
         'albums=${_recentAlbums.value.length} '
@@ -200,23 +247,44 @@ class _HomePageState extends State<HomePage>
         'tracks=${_recentTracks.value.length}',
       );
       // 写回缓存（永久保留，下次启动仍用于渲染）
-      try {
-        final data = _HomeCacheData(
-          favorites: _favoriteSongs.value,
-          recentSongs: _recentSongs.value,
-          recentAlbums: _recentAlbums.value,
-          playlists: _playlists.value,
-          recentTracks: _recentTracks.value,
-        );
-        await ApiCacheManager.instance.set(
-          scope: homeCacheScope,
-          key: homeCacheKey,
-          jsonData: jsonEncode(data.toJson()),
-        );
-      } catch (e, stack) {
-        debugPrint('[HomePage] cache write error: $e\n$stack');
-      }
+      await _persistHomeCache();
     }
+  }
+
+  Future<void> _persistHomeCache() {
+    if (!_homeCacheReady) return Future<void>.value();
+    final data = _HomeCacheData(
+      roamQueue: _roamQueue.value,
+      roamId: _roamId.value,
+      favorites: _favoriteSongs.value,
+      recentSongs: _recentSongs.value,
+      recentAlbums: _recentAlbums.value,
+      playlists: _playlists.value,
+      recentTracks: _recentTracks.value,
+    );
+    final jsonData = jsonEncode(data.toJson());
+    _homeCacheWriteChain = _homeCacheWriteChain
+        .catchError((_) {})
+        .then((_) async {
+          try {
+            await ApiCacheManager.instance.set(
+              scope: 'home',
+              key: 'dashboard',
+              jsonData: jsonData,
+            );
+          } catch (e, stack) {
+            debugPrint('[HomePage] cache write error: $e\n$stack');
+          }
+        });
+    return _homeCacheWriteChain;
+  }
+
+  void _scheduleHomeCachePersist() {
+    _homeCachePersistTimer?.cancel();
+    _homeCachePersistTimer = Timer(
+      const Duration(milliseconds: 250),
+      () => unawaited(_persistHomeCache()),
+    );
   }
 
   void _preloadHomeCovers() {
@@ -294,7 +362,50 @@ class _HomePageState extends State<HomePage>
     }
   }
 
-  Future<void> _loadRoam() async {
+  void _setRoamQueue(List<SongEntity> songs, {String? roamId}) {
+    final limit = AppPlaybackQueueSettings.maxQueueLength.value.clamp(10, 1000);
+    final queue = mergeRoamQueue(const [], songs, limit: limit);
+    _roamQueue.value = queue;
+    _roamSong.value = queue.isEmpty ? null : queue.first;
+    if (roamId != null && roamId.isNotEmpty) {
+      _roamId.value = roamId;
+    }
+  }
+
+  void _syncPendingRoamFromPlayer() {
+    if (!_homeCacheReady || !_player.roamActive) return;
+    final snapshot = _player.snapshot.value;
+    if (snapshot.queue.isEmpty ||
+        snapshot.index < 0 ||
+        snapshot.index >= snapshot.queue.length) {
+      return;
+    }
+
+    final pending = snapshot.queue.skip(snapshot.index + 1).toList();
+    final playerIds = snapshot.queue.map((song) => song.id).toSet();
+    final cachedOutsidePlayer = _roamQueue.value.where(
+      (song) => !playerIds.contains(song.id),
+    );
+    final limit = AppPlaybackQueueSettings.maxQueueLength.value.clamp(10, 1000);
+    final nextQueue = mergeRoamQueue(
+      pending,
+      cachedOutsidePlayer.toList(),
+      limit: limit,
+    );
+    final oldIds = _roamQueue.value.map((song) => song.id).join('\n');
+    final nextIds = nextQueue.map((song) => song.id).join('\n');
+    if (oldIds == nextIds && _roamId.value == _player.roamId) return;
+
+    _setRoamQueue(nextQueue, roamId: _player.roamId);
+    if (nextQueue.isEmpty) {
+      _roamSong.value = snapshot.song;
+    }
+    _scheduleHomeCachePersist();
+  }
+
+  Future<void> _loadRoam({bool force = false}) async {
+    if (_roamNetworkLoaded && !force) return;
+    _roamNetworkLoaded = true;
     try {
       final deviceId = await AuthService.instance.ensureDeviceId();
       final response = await _api.getRoamStart(deviceId);
@@ -309,16 +420,25 @@ class _HomePageState extends State<HomePage>
           _trackService.trackToSongEntity(response.next!.track.toJson()),
         );
       }
+      final limit = AppPlaybackQueueSettings.maxQueueLength.value.clamp(
+        10,
+        1000,
+      );
+      final merged = mergeRoamQueue(
+        _roamQueue.value,
+        queue,
+        limit: limit,
+      );
       debugPrint(
         '[HomePage] loadRoam roamId=$roamId current=${track.id} '
-        'queue=[${queue.map((s) => s.id).join(',')}]',
+        'cached=${_roamQueue.value.length} appended=${queue.length} '
+        'queue=[${merged.map((s) => s.id).join(',')}]',
       );
       if (mounted) {
-        _roamId.value = roamId;
-        _roamSong.value = track;
-        _roamQueue.value = queue;
+        _setRoamQueue(merged, roamId: roamId);
       }
     } catch (e, stack) {
+      _roamNetworkLoaded = false;
       debugPrint('[HomePage] roam error: $e\n$stack');
     }
   }
@@ -330,19 +450,44 @@ class _HomePageState extends State<HomePage>
   /// 队列会重建当前 run，打断正在播放的音乐。需要播放新歌时由用户点 Banner
   /// 触发 [_extendAndPlay]（以当前显示歌为队首重开队列）。
   Future<void> _refreshRoam() async {
+    if (_refreshingRoam) return;
+    _refreshingRoam = true;
     final currentRoamId = _roamId.value;
+    final queueBeforeRefresh = _roamQueue.value;
+    final skippedSongId = queueBeforeRefresh.isEmpty
+        ? null
+        : queueBeforeRefresh.first.id;
+    if (queueBeforeRefresh.length > 1) {
+      _setRoamQueue(
+        queueBeforeRefresh.sublist(1),
+        roamId: currentRoamId,
+      );
+      _scheduleHomeCachePersist();
+    }
     try {
       final deviceId = await AuthService.instance.ensureDeviceId();
       final song = await _fetchNextRoamSong(deviceId, currentRoamId);
       if (song == null || !mounted) return;
-      _roamSong.value = song;
-      // 无论是否正在播放，_roamQueue 都以「当前显示的漫游歌」为队首：
-      // 点播放时播的就是 Banner 上这首歌。此前播放中刷新会把新歌 append
-      // 进 _roamQueue，队列变成 [旧歌, 新歌]，点播放仍从旧歌开始——表现为
-      // 「刷新后点播放，播的还是上一次刷新的歌」。
-      _roamQueue.value = [song];
+      final currentQueue = _roamQueue.value;
+      final pending =
+          queueBeforeRefresh.length <= 1 &&
+              currentQueue.isNotEmpty &&
+              currentQueue.first.id == skippedSongId
+          ? currentQueue.sublist(1)
+          : currentQueue;
+      final limit = AppPlaybackQueueSettings.maxQueueLength.value.clamp(
+        10,
+        1000,
+      );
+      _setRoamQueue(
+        mergeRoamQueue(pending, [song], limit: limit),
+        roamId: _roamId.value,
+      );
+      _scheduleHomeCachePersist();
     } catch (e, stack) {
       debugPrint('[HomePage] refresh roam error: $e\n$stack');
+    } finally {
+      _refreshingRoam = false;
     }
   }
 

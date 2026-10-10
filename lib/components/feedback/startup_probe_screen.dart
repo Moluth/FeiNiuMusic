@@ -25,7 +25,7 @@ class _StartupProbeScreenState extends State<StartupProbeScreen>
   late final AnimationController _scanController;
   late final Animation<double> _pulseAnim;
 
-  String _statusText = '正在探测连接...';
+  String _statusText = '正在准备音乐...';
   String _detailText = '';
   bool _done = false;
 
@@ -69,7 +69,7 @@ class _StartupProbeScreenState extends State<StartupProbeScreen>
     final cache = AppFnConnectionSettings.cachedConnection;
 
     setState(() {
-      _detailText = cache != null ? '优先使用缓存节点' : '正在尝试多种连接方式';
+      _detailText = cache != null ? '正在恢复上次内容' : '正在同步音乐库';
     });
 
     // 给动画一点时间先渲染
@@ -83,7 +83,7 @@ class _StartupProbeScreenState extends State<StartupProbeScreen>
         fnId: fnId,
       );
 
-      setState(() => _statusText = '连接成功');
+      setState(() => _statusText = '音乐已就绪');
 
       await AppFnConnectionSettings.saveProbeResult(
         fnId: fnId,
@@ -100,14 +100,14 @@ class _StartupProbeScreenState extends State<StartupProbeScreen>
       FeiNiuApiClient.instance.setRelayMode(result.isRelay);
     } catch (_) {
       if (!mounted) return;
-      setState(() => _detailText = '探测暂不可用，进入主页面后自动重试');
+      setState(() => _detailText = '先使用本地内容，稍后自动同步');
     }
 
     if (!mounted) return;
     setState(() => _done = true);
 
-    // 短暂停留让用户看到结果
-    await Future<void>.delayed(const Duration(milliseconds: 600));
+    // 状态就绪后快速进入首页，连接细节留在后台处理。
+    await Future<void>.delayed(const Duration(milliseconds: 200));
     if (!mounted) return;
 
     widget.onProbeComplete();
