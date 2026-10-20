@@ -60,7 +60,9 @@ class TvDetection {
 
     if (Platform.isAndroid) {
       try {
-        final value = await _channel.invokeMethod<bool>('isTvDevice');
+        final value = await _channel
+            .invokeMethod<bool>('isTvDevice')
+            .timeout(const Duration(seconds: 2), onTimeout: () => false);
         if (value != null) {
           result.value = value;
           return value;

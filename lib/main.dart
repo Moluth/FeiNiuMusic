@@ -29,12 +29,13 @@ import 'app/services/feiniu/api_client.dart';
 import 'app/services/feiniu/auth_service.dart';
 import 'app/services/feiniu/fn_connection_probe_service.dart';
 import 'app/services/song_match/match_source_state.dart';
+import 'app/startup/app_startup_bootstrap.dart';
 import 'app/state/settings_island_lyric.dart';
 import 'app/state/settings_lyric_companion.dart';
 import 'app/state/settings_match.dart';
 import 'app/state/settings_state.dart';
 
-Future<void> main() async {
+void main() {
   // 在一切之前安装进程级 SSL 拦截钩子
   // 此钩子覆盖进程内所有 HttpClient（Dio、CachedNetworkImage/flutter_cache_manager 等共用），
   // 使 SSL 忽略开关全局生效，无需逐处配置。
@@ -47,6 +48,31 @@ Future<void> main() async {
   // 必须在任何 SharedPreferences / path_provider 读取之前替换全局实例，
   // 否则 prefs/数据库/缓存会落回系统 %APPDATA%。
   AppPortableStorage.overridePathProviderForPortable();
+
+  // Android 原生 Splash 只有在 Flutter 提交首帧后才会移除。先渲染轻量启动页，
+  // 再执行插件/磁盘初始化；即使某个原生通道偶发不返回，也会由门控超时放行，
+  // 不再永久停留在只显示图标的系统开屏。
+  runApp(
+    AppStartupBootstrap(
+      initialize: _initializeApp,
+      readyBuilder: (_) => _buildInitializedApp(),
+      onTimeout: (stage) {
+        final message =
+            '[Startup] timeout at "$stage", continuing with defaults';
+        debugPrint(message);
+        DebugLogService.instance.add(message);
+      },
+      onError: (error, stackTrace, stage) {
+        final message = '[Startup] failed at "$stage": $error\n$stackTrace';
+        debugPrint(message);
+        DebugLogService.instance.add(message);
+      },
+    ),
+  );
+}
+
+Future<void> _initializeApp(ValueChanged<String> updateStage) async {
+  updateStage('正在初始化播放组件');
   // 初始化 media_kit（加载 libmpv 原生库）。必须在任何 Player() 构造前调用；
   // 放在认证恢复之前，不依赖网络/账号状态。
   try {
@@ -54,6 +80,8 @@ Future<void> main() async {
   } catch (e) {
     debugPrint('MediaKit.ensureInitialized failed: $e');
   }
+
+  updateStage('正在读取本地设置');
   await DebugLogService.instance.ensureLoaded();
   // 全局异常捕获：release 下 Flutter 默认只输出无信息的
   // “Another exception was thrown: Instance of 'DiagnosticsProperty<void>'”
@@ -72,7 +100,9 @@ Future<void> main() async {
     // 返回 false：仅记录，不拦截默认崩溃处理（避免掩盖真正的进程级错误）
     return false;
   };
-  // TV 检测必须在 runApp 前完成，避免首帧后再切换布局造成闪变。
+
+  updateStage('正在适配当前设备');
+  // TV 检测必须在业务 App 挂载前完成，避免主界面首帧后再切换布局造成闪变。
   await TvDetection.ensureLoaded();
   final isTvDevice = TvDetection.result.value;
   // 先加载设置：确保持久化的「TV 模式」手动开关已就位，再合并检测结果。
@@ -84,13 +114,19 @@ Future<void> main() async {
   AppLayoutSettings.syncTvMode();
   // 按设备类型锁定方向：TV 恒横屏；平板（或手动平板模式）四方向自由旋转；
   // 手机锁竖屏。运行中开关切换由 app.dart 的 _TvOrientationSync 负责再应用。
-  await SystemChrome.setPreferredOrientations(
-    AppLayoutSettings.orientationsForDevice(
-      isTv: AppLayoutSettings.tvMode.value,
-      shortestSide: AppLayoutSettings.currentShortestSide(),
-      manualTabletMode: AppLayoutSettings.tabletMode.value,
-    ),
-  );
+  try {
+    await SystemChrome.setPreferredOrientations(
+      AppLayoutSettings.orientationsForDevice(
+        isTv: AppLayoutSettings.tvMode.value,
+        shortestSide: AppLayoutSettings.currentShortestSide(),
+        manualTabletMode: AppLayoutSettings.tabletMode.value,
+      ),
+    ).timeout(const Duration(seconds: 2));
+  } catch (error) {
+    debugPrint('[Startup] orientation setup failed/timeout: $error');
+  }
+
+  updateStage('正在恢复账号与播放状态');
   // 必须先恢复认证信息（token / 服务器地址）再初始化播放相关服务：
   // MediaNotificationService.init() 会实例化 PlayerService，其启动恢复流程
   // （含「进入应用自动播放」）依赖 FeiNiuApiClient.baseUrl 已就绪，
@@ -115,10 +151,10 @@ Future<void> main() async {
   // Android：MediaSession / 通知栏 / Android Auto。
   // iOS/macOS：MPNowPlayingInfoCenter / MPRemoteCommandCenter（锁屏/控制中心“正在播放”）。
   //
-  // 不 await 阻塞首帧：audio_service 在 Android Auto 场景（后台引擎/系统先绑定
+  // 不 await 阻塞主界面：audio_service 在 Android Auto 场景（后台引擎/系统先绑定
   // MediaBrowserService）存在 configure 竞态，AudioService.init 可能长时间挂起。
   // 若在这里阻塞，手机端会永久卡在启动界面、车机端 getChildren 无响应转圈。
-  // 内部已带超时 + 重试（见 _initHandler），此处放行让 runApp 立即渲染；
+  // 内部已带超时 + 重试（见 _initHandler），此处放行让启动流程继续；
   // 首次播放的 _initListener 兜底仍会在需要时强制补齐 handler。
   if (Platform.isAndroid || Platform.isIOS || Platform.isMacOS) {
     unawaited(
@@ -138,6 +174,8 @@ Future<void> main() async {
     // 消除滚动/切页时合成间隙露黑底的整窗闪烁。
     await MacosWindowBackgroundService.init();
   }
+
+  updateStage('正在应用界面设置');
   // 切歌通知监听：PlayerService 已构造（MediaNotificationService.init 内），
   // AppLayoutSettings 已在上面 ensureLoaded，可安全订阅 currentSong。
   // AppThemeSettings 需先 ensureLoaded：TrackChangeOverlayService 在切歌时
@@ -169,7 +207,7 @@ Future<void> main() async {
   }());
   await LyricCompanionSettings.ensureLoaded();
   await AppBackgroundSettings.ensureLoaded();
-  // 液体玻璃设置需在首帧前加载：首帧即尊重持久化的关闭态，避免闪一帧玻璃。
+  // 液体玻璃设置需在业务 App 挂载前加载：主界面首帧即尊重持久化的关闭态。
   await AppGlassSettings.ensureLoaded();
   await AppFnConnectionSettings.ensureLoaded();
   // 已保存账号列表初始化：迁移/校正当前账号，并注册 401 token 同步回调。
@@ -186,54 +224,55 @@ Future<void> main() async {
   if (Platform.isWindows) {
     await DesktopTrayService.init();
   }
+
+  updateStage('正在准备音乐服务');
   // 初始化自动重连服务（监听网络变化 + API 失败）
   FnAutoReconnectService.instance.init();
   // 后台维护音频缓存：迁移旧目录、清理中断文件与超过保留期的临时歌曲。
   unawaited(StreamCacheService.instance.performMaintenance());
-  // 液体玻璃：预热 shader（非阻塞异步磁盘 I/O，0.30.x 保证 runApp 前零 GPU
-  // 调用，首帧不卡顿）。开关只决定渲染哪个组件分支，此处始终初始化。
-  await LiquidGlassWidgets.initialize();
+  // 液体玻璃：在业务 App 挂载前预热 shader（异步磁盘 I/O，不阻塞已显示的
+  // Flutter 启动页）。开关只决定渲染哪个组件分支，此处始终初始化。
+  updateStage('正在准备界面渲染');
+  try {
+    await LiquidGlassWidgets.initialize().timeout(const Duration(seconds: 4));
+  } catch (error) {
+    debugPrint('[Startup] liquid glass initialization failed/timeout: $error');
+  }
+
+  // Flutter 启动页已经提交首帧，以下低优先级任务可以直接并行预热。
+  unawaited(SharedPreferences.getInstance());
+  _warmupConnection();
+  FavoriteMediaCacheService.instance.start();
+  Timer(const Duration(seconds: 30), () {
+    unawaited(BackupService.instance.maybeAutoBackupOnLaunch());
+  });
+}
+
+Widget _buildInitializedApp() {
   // 用 LiquidGlassWidgets.wrap 包裹整个 App：
   // - brightnessResolver: Theme.maybeBrightnessOf —— MaterialApp 必须传，
   //   否则暗色模式下玻璃阴影/描边会消失；
   // - theme: 全局玻璃主题。监听主题种子色 + 玻璃可调参数（模糊/厚度），
   //   变化时重建 wrap（GlassTheme 是 InheritedWidget，重建安全、树形不变）；
   // - adaptiveQuality: 自动按设备性能封顶质量。
-  runApp(
-    ListenableBuilder(
-      listenable: Listenable.merge([
-        AppThemeSettings.themeSeedColor,
-        AppGlassSettings.glassBlurStrength,
-        AppGlassSettings.glassThickness,
-      ]),
-      builder: (context, _) => LiquidGlassWidgets.wrap(
-        child: const FeiNiuMusicApp(),
-        brightnessResolver: Theme.maybeBrightnessOf,
-        theme: appGlassTheme(
-          AppThemeSettings.themeSeedColor.value ?? const Color(0xFF3B82F6),
-        ),
-        // 关闭自适应质量：GlassAdaptiveScope（experimental）会在滚动触发帧耗时
-        // 波动时频繁降级/恢复质量，整屏玻璃表面随之重建 → 滚动时黑屏闪烁。
-        // 固定为 theme 中显式指定的稳定质量（见 appGlassTheme quality）。
-        adaptiveQuality: false,
+  return ListenableBuilder(
+    listenable: Listenable.merge([
+      AppThemeSettings.themeSeedColor,
+      AppGlassSettings.glassBlurStrength,
+      AppGlassSettings.glassThickness,
+    ]),
+    builder: (context, _) => LiquidGlassWidgets.wrap(
+      child: const FeiNiuMusicApp(),
+      brightnessResolver: Theme.maybeBrightnessOf,
+      theme: appGlassTheme(
+        AppThemeSettings.themeSeedColor.value ?? const Color(0xFF3B82F6),
       ),
+      // 关闭自适应质量：GlassAdaptiveScope（experimental）会在滚动触发帧耗时
+      // 波动时频繁降级/恢复质量，整屏玻璃表面随之重建 → 滚动时黑屏闪烁。
+      // 固定为 theme 中显式指定的稳定质量（见 appGlassTheme quality）。
+      adaptiveQuality: false,
     ),
   );
-  // Fire-and-forget warm-ups that run in parallel with the first frame so
-  // per-page initState calls don't have to pay for these cold starts:
-  //   - SharedPreferences.getInstance() reads its backing file once, then
-  //     serves subsequent callers from the in-memory instance.
-  SharedPreferences.getInstance();
-  // 后台连接预热：静默验证缓存连接的可用性，不可用时自动回退完整探测
-  // 不阻塞首页渲染，首页首次请求走已有连接，预热找到更好的 URL 会无缝切换。
-  _warmupConnection();
-  // 收藏歌曲离线缓存是低优先级任务，且会在登录账号变化后重新调度。
-  FavoriteMediaCacheService.instance.start();
-  // 自动备份属于低优先级全量磁盘/网络任务，延后到启动与连接预热稳定后执行，
-  // 避免与首屏、账号恢复、更新检查同时争用 CPU 和网络。
-  Timer(const Duration(seconds: 30), () {
-    unawaited(BackupService.instance.maybeAutoBackupOnLaunch());
-  });
 }
 
 /// 进程级 SSL 证书校验覆盖

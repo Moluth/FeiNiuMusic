@@ -18,7 +18,9 @@ class AndroidPlatformService {
     final cached = _sdkInt;
     if (cached != null) return cached;
     try {
-      final value = await _channel.invokeMethod<int>('getAndroidSdkInt');
+      final value = await _channel
+          .invokeMethod<int>('getAndroidSdkInt')
+          .timeout(const Duration(seconds: 2), onTimeout: () => 0);
       _sdkInt = value ?? 0;
     } catch (_) {
       _sdkInt = 0;

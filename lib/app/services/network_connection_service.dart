@@ -26,7 +26,11 @@ class NetworkConnectionService {
 
   Future<void> _doInit() async {
     try {
-      _update(await Connectivity().checkConnectivity());
+      final initial = await Connectivity().checkConnectivity().timeout(
+        const Duration(seconds: 2),
+        onTimeout: () => const <ConnectivityResult>[],
+      );
+      _update(initial);
     } catch (e) {
       if (kDebugMode) {
         debugPrint('[NetworkConnection] Initial check failed: $e');
